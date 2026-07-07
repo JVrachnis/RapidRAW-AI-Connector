@@ -1,0 +1,16 @@
+[Unit]
+Description=rr-ai-gateway (AI operations gateway for RapidRAW & friends)
+After=network-online.target
+
+[Service]
+WorkingDirectory=%h/rr-ai-gateway
+Environment=COMFY_HOST=127.0.0.1
+Environment=COMFY_PORT=8188
+Environment=CACHE_DIR=%h/rr-ai-gateway/cache
+# Environment=GATEWAY_TOKEN=change-me
+ExecStart=%h/rr-ai-gateway/.venv/bin/python main.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

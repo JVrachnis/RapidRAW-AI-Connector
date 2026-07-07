@@ -16,6 +16,8 @@ class InpaintPayload(BaseModel):
 
 
 # legacy client ids -> content-store ids (in-memory; legacy flow re-uploads freely)
+# Process-wide and in-memory by design: this assumes a single-instance
+# deployment (no multi-worker/multi-process gateway sharing these aliases).
 _ALIASES: dict[str, str] = {}
 
 
