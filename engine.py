@@ -28,6 +28,18 @@ class Settings(BaseSettings):
     WORKFLOW_FILE: Path = Path("workflow.json")
     MAX_CACHE_FILES: int = 20
     MAX_CACHE_SIZE_MB: int = 2048
+    GATEWAY_TOKEN: Optional[str] = None
+    GATEWAY_TOOLS_DIR: str = os.path.expanduser("~/comfy")
+    GATEWAY_CACHE_MAX_GB: int = 20
+    GATEWAY_RESULT_TTL_HOURS: int = 24
+    GATEWAY_JOB_TIMEOUT_S: int = 600
+    GATEWAY_DB_PATH: Optional[Path] = None
+    GATEWAY_COMFY_VENV_PY: str = os.path.expanduser("~/comfy/ComfyUI/.venv/bin/python")
+    GATEWAY_RAWTOOLS_PY: str = os.path.expanduser("~/rawtools/bin/python")
+
+    @property
+    def gateway_db_path(self) -> Path:
+        return self.GATEWAY_DB_PATH or (self.CACHE_DIR / "gateway.sqlite3")
 
     @property
     def source_cache_dir(self) -> Path:
