@@ -51,6 +51,9 @@ def create_app(settings: Settings, load_caps: bool = True) -> FastAPI:
     app.state.queue = queue
     app.include_router(router, dependencies=[Depends(auth)])
 
+    from .legacy import router as legacy_router
+    app.include_router(legacy_router, dependencies=[Depends(auth)])
+
     @app.get("/health")
     async def health():
         comfy_up = await ComfyClient.check_health()
