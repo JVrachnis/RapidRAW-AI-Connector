@@ -42,9 +42,11 @@ def test_unknown_id_returns_none(tmp_path):
     assert st.get("deadbeef" * 8) is None
 
 def test_eviction_raises_gone_on_get(tmp_path):
-    st = make_store(tmp_path, max_bytes=100)  # tiny cap: a=77B, b=80B; combined 157B > cap
-
-    r1 = st.add(png_bytes(color=(1, 2, 3)), "a.png")
-    st.add(png_bytes(16, 12, (4, 5, 6)), "b.png")  # bigger, evicts a
+    a_bytes = png_bytes(color=(1, 2, 3))
+    b_bytes = png_bytes(16, 12, (4, 5, 6))
+    # cap holds either file alone but not both -> adding b evicts a (LRU)
+    st = make_store(tmp_path, max_bytes=len(a_bytes) + len(b_bytes) - 1)
+    r1 = st.add(a_bytes, "a.png")
+    st.add(b_bytes, "b.png")
     with pytest.raises(SourceEvicted):
         st.get(r1["source_id"])
