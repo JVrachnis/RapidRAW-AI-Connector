@@ -197,3 +197,30 @@ async def test_nonraw_mask_upscaled_to_source_dims(tmp_path):
     ctx.run_tool = rec
     result = await M.handle(ctx)
     assert (result["width"], result["height"]) == (16, 12)
+
+
+@pytest.mark.asyncio
+async def test_prompt_sam3_backend_routes_to_c2f(tmp_path):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "the dog.", "backend": "sam3"})
+    rec = ToolRecorder(); ctx.run_tool = rec
+    await M.handle(ctx)
+    cmd = rec.calls[0]
+    assert cmd[1].endswith("mask_c2f.py")
+    assert cmd[cmd.index("--backend") + 1] == "sam3"
+    assert "--sam3-multirep" not in cmd
+
+@pytest.mark.asyncio
+async def test_prompt_sam3_multirep_flags(tmp_path):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "the dog.", "backend": "sam3",
+                              "sam3_multirep": True})
+    rec = ToolRecorder(); ctx.run_tool = rec
+    await M.handle(ctx)
+    cmd = rec.calls[0]
+    assert "--sam3-multirep" in cmd and "--sam3-parallel" in cmd
+
+@pytest.mark.asyncio
+async def test_prompt_default_backend_still_mask_hq(tmp_path):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "the dog."})
+    rec = ToolRecorder(); ctx.run_tool = rec
+    await M.handle(ctx)
+    assert rec.calls[0][1].endswith("mask_hq.py")

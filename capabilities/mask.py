@@ -24,6 +24,7 @@ PARAMS_SCHEMA = {
         "preset": {"enum": ["subject", "sky", "foreground"]},
         "agentic": {"type": "boolean", "default": False},
         "backend": {"enum": ["sam2", "sam3"], "default": "sam2"},
+        "sam3_multirep": {"type": "boolean", "default": False},
         "matte": {"type": "boolean", "default": True},
         "ev_stack": {},
     },
@@ -143,6 +144,12 @@ async def handle(ctx) -> dict:
             target = f"{target} (photo context: {', '.join(tags)})"
         cmd = [py, _tool(settings, "mask_agentic.py"), str(image_path),
                "--target", target, "--backend", backend, "--out", str(out_path)]
+    elif mode == "prompt" and backend == "sam3":
+        cmd = [py, _tool(settings, "mask_c2f.py"), str(image_path),
+               "--query", p["query"], "--backend", "sam3",
+               "--birefnet-mode", "auto", "--out", str(out_path)]
+        if p.get("sam3_multirep"):
+            cmd += ["--sam3-multirep", "--sam3-parallel"]
     elif mode == "prompt":
         cmd = [py, _tool(settings, "mask_hq.py"), str(image_path),
                "--query", p["query"], "--out", str(out_path)]
