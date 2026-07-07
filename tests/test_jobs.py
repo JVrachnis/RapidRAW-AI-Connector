@@ -14,7 +14,9 @@ def make_queue(db, tmp_path, handlers, timeout_s=5, ttl_hours=24):
 async def wait_status(q, job_id, statuses, timeout=5.0):
     for _ in range(int(timeout / 0.02)):
         j = q.get(job_id)
-        if j["status"] in statuses:
+        # Row may already be gone if aggressive pruning (e.g. ttl_hours=0) raced
+        # ahead of this poll; treat that as "reached a terminal state".
+        if j is None or j["status"] in statuses:
             return j
         await asyncio.sleep(0.02)
     raise TimeoutError(q.get(job_id))
@@ -127,6 +129,36 @@ async def test_stop_terminates_running_handler_without_orphan(db, tmp_path):
         await asyncio.sleep(0.02)
     assert q2.get(j["job_id"])["status"] in ("queued", "running")
     await q2.stop()
+
+@pytest.mark.asyncio
+async def test_done_events_do_not_accumulate(db, tmp_path):
+    async def ok(ctx):
+        return {}
+    q = make_queue(db, tmp_path, {"k": ok}, ttl_hours=0)  # everything prunable immediately
+    await q.start()
+    ids = [q.submit("k", "s", {}, "interactive")["job_id"] for _ in range(5)]
+    for jid in ids:
+        await wait_status(q, jid, {"done"})
+    q._prune()
+    assert len(q._done_events) == 0
+    await q.stop()
+
+@pytest.mark.asyncio
+async def test_cancelled_by_user_set_drains_on_timeout(db, tmp_path):
+    async def sleepy(ctx):
+        await asyncio.sleep(10)
+        return {}
+    q = make_queue(db, tmp_path, {"s": sleepy}, timeout_s=0.15)
+    await q.start()
+    j = q.submit("s", "s", {}, "interactive")
+    for _ in range(200):
+        if q.get(j["job_id"])["status"] == "running":
+            break
+        await asyncio.sleep(0.01)
+    q._cancelled_by_user.add(j["job_id"])  # simulate cancel losing the race
+    done = await wait_status(q, j["job_id"], {"error", "cancelled"})
+    assert q._cancelled_by_user == set()
+    await q.stop()
 
 @pytest.mark.asyncio
 async def test_startup_recovery_requeues_running(db, tmp_path):

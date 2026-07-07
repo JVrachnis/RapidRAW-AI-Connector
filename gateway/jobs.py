@@ -162,6 +162,14 @@ class JobQueue:
         cutoff = now() - self.result_ttl_hours * 3600
         self.db.execute("DELETE FROM jobs WHERE status IN ('done','error','cancelled') AND finished < ?",
                         (cutoff,))
+        # Sweep _done_events for entries whose job row is gone. We only drop
+        # entries whose event is already set (i.e. the job reached a terminal
+        # state and _finish() ran) so we never strand a waiter that is
+        # currently blocked in wait() on an unset event.
+        dead = [jid for jid, ev in self._done_events.items()
+                if ev.is_set() and self.db.query_one("SELECT 1 FROM jobs WHERE id=?", (jid,)) is None]
+        for jid in dead:
+            del self._done_events[jid]
 
     async def _worker(self):
         while True:
@@ -198,6 +206,7 @@ class JobQueue:
                     await self._running_task
                 except (asyncio.CancelledError, Exception):
                     pass
+                self._cancelled_by_user.discard(job_id)  # a racing user-cancel lost to the timeout
                 self._finish(job_id, "error", error={"kind": "timeout",
                              "detail": f"exceeded {self.job_timeout_s}s"})
             except asyncio.CancelledError:
@@ -212,6 +221,7 @@ class JobQueue:
                 else:
                     raise  # queue itself is being stopped
             except Exception as e:
+                self._cancelled_by_user.discard(job_id)  # a racing user-cancel lost to this error
                 self._finish(job_id, "error", error={
                     "kind": getattr(e, "kind", "handler_error"),
                     "detail": f"{e}\n{traceback.format_exc(limit=5)}"})
