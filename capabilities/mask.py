@@ -39,7 +39,15 @@ PARAMS_SCHEMA = {
     ],
 }
 
-LABEL_RE = re.compile(r"detected:\s*([a-zA-Z][\w \-]*?)\s+[\d.]+", re.MULTILINE)
+# Real tool stdout (verified on inferno against mask_hq.py / grounded_sam.py):
+#   "   detected: the main subject(0.61)"
+#   "   detected: person(0.91), dog(0.55)"
+#   "[understanding] detected 3 objects: person(0.91), dog(0.55), cat(0.30)"
+#   "   detected: none"
+# i.e. a "detected[...]:" prefix (optionally "N objects") followed by zero or
+# more comma-separated "label(score)" pairs, or the literal "none".
+LABEL_LINE_RE = re.compile(r"detected\b[^:]*:\s*(.+)", re.IGNORECASE)
+LABEL_ITEM_RE = re.compile(r"([a-zA-Z][\w \-]*?)\(\s*[\d.]+\s*\)")
 EV_FRAME_RE = re.compile(r"_EV([+-]?[0-9.]+)\.(jpg|jpeg|png)$", re.IGNORECASE)
 
 
@@ -60,9 +68,15 @@ def pick_base_frame(outdir: Path) -> Path:
 
 
 def parse_labels(stdout: str) -> list[str]:
-    """Best-effort extraction of 'detected: <label> <score>' lines from tool
+    """Best-effort extraction of 'detected: label(score), ...' lines from tool
     stdout. Never raises; an empty list is a valid (if uninformative) result."""
-    return LABEL_RE.findall(stdout)
+    labels = []
+    for line in stdout.splitlines():
+        m = LABEL_LINE_RE.search(line)
+        if not m:
+            continue
+        labels.extend(label.strip() for label in LABEL_ITEM_RE.findall(m.group(1)))
+    return labels
 
 
 def reconcile_mask(mask: np.ndarray, target_w: int, target_h: int) -> np.ndarray:

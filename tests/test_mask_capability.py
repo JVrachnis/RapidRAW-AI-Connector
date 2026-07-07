@@ -50,7 +50,7 @@ class ToolRecorder:
                 Image.new("RGB", (8, 6)).save(outdir / f"src_EV{ev}.jpg")
             Image.new("RGB", (8, 6)).save(outdir / "src_stack.jpg")
             (outdir / "src_exif.json").write_text("{}")
-        return 0, "detected: person 0.91\n", ""
+        return 0, "   detected: person(0.91)\n", ""
 
 @pytest.mark.asyncio
 async def test_prompt_mode_calls_mask_hq(tmp_path):
@@ -128,7 +128,16 @@ async def test_rrdata_tags_extend_query(tmp_path):
     assert q == "the dog."   # tags only seed AGENTIC target expansion, not plain queries
 
 def test_parse_labels_tolerant():
-    assert M.parse_labels("detected: person 0.91\ndetected: dog 0.5\n") == ["person", "dog"]
+    # Real stdout format (verified on inferno against mask_hq.py / grounded_sam.py):
+    # "   detected: label(score)[, label(score)...]" -- score in parens, no space,
+    # comma-separated for multiple detections, possibly prefixed with a count
+    # ("[understanding] detected 3 objects: ...") and "none" when nothing matched.
+    assert M.parse_labels("   detected: the main subject(0.61)\n") == ["the main subject"]
+    assert M.parse_labels("   detected: person(0.91), dog(0.55)\n") == ["person", "dog"]
+    assert M.parse_labels(
+        "[understanding] detected 3 objects: person(0.91), dog(0.55), cat(0.30)\n"
+    ) == ["person", "dog", "cat"]
+    assert M.parse_labels("   detected: none\n") == []
     assert M.parse_labels("no matches here") == []
 
 def test_reconcile_mask_center_crops_and_pads():
