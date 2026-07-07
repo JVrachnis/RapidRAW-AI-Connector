@@ -7,8 +7,8 @@ from .store import SourceEvicted
 router = APIRouter()
 
 @router.get("/capabilities")
-async def capabilities():
-    return registry.describe()
+async def capabilities(request: Request):
+    return registry.describe(request.app.state.capabilities)
 
 @router.post("/sources")
 async def add_source(request: Request, file: UploadFile = File(...),
@@ -27,7 +27,8 @@ async def add_source(request: Request, file: UploadFile = File(...),
 
 @router.post("/jobs/{capability}", status_code=202)
 async def submit_job(capability: str, request: Request, body: dict):
-    if registry.get(capability) is None:
+    caps = request.app.state.capabilities
+    if capability not in caps:
         raise HTTPException(404, f"unknown capability {capability!r}")
     source_id = body.get("source_id")
     params = body.get("params", {})
@@ -35,7 +36,7 @@ async def submit_job(capability: str, request: Request, body: dict):
     if priority not in ("interactive", "batch"):
         raise HTTPException(422, "priority must be 'interactive' or 'batch'")
     try:
-        registry.validate_params(capability, params)
+        registry.validate_params(capability, params, caps)
     except ParamsInvalid as e:
         raise HTTPException(422, str(e))
     try:

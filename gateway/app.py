@@ -16,6 +16,10 @@ def create_app(settings: Settings, load_caps: bool = True) -> FastAPI:
     if load_caps:
         registry.load_capabilities()
 
+    # Per-app snapshot: this app's routes and queue must agree on one registry
+    # state even if the global REGISTRY is mutated after create_app().
+    caps = dict(registry.REGISTRY)
+
     db = Db(settings.gateway_db_path)
     store = SourceStore(db=db, root=settings.CACHE_DIR / "sources",
                         max_bytes=settings.GATEWAY_CACHE_MAX_GB * 1024 ** 3)
@@ -30,14 +34,14 @@ def create_app(settings: Settings, load_caps: bool = True) -> FastAPI:
 
     queue = JobQueue(
         db=db, workdir_root=settings.CACHE_DIR / "jobs",
-        handlers={c.id: c.handler for c in registry.REGISTRY.values()},
+        handlers={c.id: c.handler for c in caps.values()},
         job_timeout_s=settings.GATEWAY_JOB_TIMEOUT_S,
         result_ttl_hours=settings.GATEWAY_RESULT_TTL_HOURS,
         make_context=make_context)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        logger.info(f"rr-ai-gateway starting; capabilities: {list(registry.REGISTRY)}")
+        logger.info(f"rr-ai-gateway starting; capabilities: {list(caps)}")
         await queue.start()
         yield
         await queue.stop()
@@ -49,6 +53,7 @@ def create_app(settings: Settings, load_caps: bool = True) -> FastAPI:
     app.state.settings = settings
     app.state.store = store
     app.state.queue = queue
+    app.state.capabilities = caps
     app.include_router(router, dependencies=[Depends(auth)])
 
     from .legacy import router as legacy_router
@@ -59,7 +64,7 @@ def create_app(settings: Settings, load_caps: bool = True) -> FastAPI:
         comfy_up = await ComfyClient.check_health()
         return {"status": "ok" if comfy_up else "degraded",
                 "comfy_url": settings.comfy_url, "connected": comfy_up,
-                "capabilities": list(registry.REGISTRY),
+                "capabilities": list(caps),
                 "queue_depth": queue.depth()}
 
     return app

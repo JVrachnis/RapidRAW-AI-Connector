@@ -65,3 +65,40 @@ def test_health_reports_capabilities(client):
     h = client.get("/health").json()
     assert "echo" in h["capabilities"]
     assert "queue_depth" in h
+
+def test_app_capability_view_survives_registry_mutation(tmp_path, clean_registry):
+    """Each app must see the registry as it was at create_app() time, matching
+    the handler snapshot its queue took — not the live global."""
+    from fastapi.testclient import TestClient
+    from engine import Settings
+    from gateway import registry
+    from gateway.app import create_app
+    from gateway.registry import Capability
+
+    async def echo(ctx):
+        return {"echo": ctx.params}
+
+    schema = {"type": "object", "required": ["msg"],
+              "properties": {"msg": {"type": "string"}}}
+    registry.register(Capability(id="echo", title="Echo",
+                                 params_schema=schema, handler=echo))
+    app1 = create_app(Settings(CACHE_DIR=tmp_path / "a", GATEWAY_JOB_TIMEOUT_S=5),
+                      load_caps=False)
+
+    registry.REGISTRY.clear()
+    registry.register(Capability(id="other", title="Other",
+                                 params_schema={"type": "object"}, handler=echo))
+    app2 = create_app(Settings(CACHE_DIR=tmp_path / "b", GATEWAY_JOB_TIMEOUT_S=5),
+                      load_caps=False)
+
+    with TestClient(app1) as c1:
+        assert [c["id"] for c in c1.get("/capabilities").json()] == ["echo"]
+        assert c1.get("/health").json()["capabilities"] == ["echo"]
+        sid = upload(c1).json()["source_id"]
+        resp = c1.post("/jobs/echo", json={"source_id": sid, "params": {"msg": "hi"}})
+        assert resp.status_code == 202
+        assert poll_done(c1, resp.json()["job_id"])["result"]["echo"] == {"msg": "hi"}
+        assert c1.post("/jobs/other", json={"source_id": sid, "params": {}}).status_code == 404
+
+    with TestClient(app2) as c2:
+        assert [c["id"] for c in c2.get("/capabilities").json()] == ["other"]
