@@ -47,8 +47,18 @@ PARAMS_SCHEMA = {
 #   "   detected: none"
 # i.e. a "detected[...]:" prefix (optionally "N objects") followed by zero or
 # more comma-separated "label(score)" pairs, or the literal "none".
+#
+# Two other tools use different formats:
+#   mask_points.py:  "detected: point-selection 0.87"  -- bare "label score",
+#                     no parens, single pair, no comma-separation.
+#   mask_c2f.py (sam3 path): "[sam3] 2 instance(s) from concepts "
+#                     "['the main subject', 'bicycle']" -- a python-repr-ish
+#                     list of quoted concept names, no scores on that line.
 LABEL_LINE_RE = re.compile(r"detected\b[^:]*:\s*(.+)", re.IGNORECASE)
 LABEL_ITEM_RE = re.compile(r"([a-zA-Z][\w \-]*?)\(\s*[\d.]+\s*\)")
+LABEL_BARE_ITEM_RE = re.compile(r"^([a-zA-Z][\w \-]*?)\s+[\d.]+\s*$")
+SAM3_CONCEPTS_LINE_RE = re.compile(r"from concepts\s*\[(.*)\]", re.IGNORECASE)
+SAM3_CONCEPT_ITEM_RE = re.compile(r"""['"]([^'"]+)['"]""")
 EV_FRAME_RE = re.compile(r"_EV([+-]?[0-9.]+)\.(jpg|jpeg|png)$", re.IGNORECASE)
 
 
@@ -69,14 +79,30 @@ def pick_base_frame(outdir: Path) -> Path:
 
 
 def parse_labels(stdout: str) -> list[str]:
-    """Best-effort extraction of 'detected: label(score), ...' lines from tool
-    stdout. Never raises; an empty list is a valid (if uninformative) result."""
+    """Best-effort extraction of labels from tool stdout: 'detected:
+    label(score), ...' (mask_hq/grounded_sam), 'detected: label score' (bare,
+    single-pair -- mask_points.py), and "from concepts ['a', 'b']" (sam3
+    concept segmentation via mask_c2f.py). Never raises; an empty list is a
+    valid (if uninformative) result."""
     labels = []
-    for line in stdout.splitlines():
-        m = LABEL_LINE_RE.search(line)
-        if not m:
-            continue
-        labels.extend(label.strip() for label in LABEL_ITEM_RE.findall(m.group(1)))
+    try:
+        for line in stdout.splitlines():
+            m = LABEL_LINE_RE.search(line)
+            if m:
+                rest = m.group(1)
+                items = LABEL_ITEM_RE.findall(rest)
+                if items:
+                    labels.extend(label.strip() for label in items)
+                else:
+                    bare = LABEL_BARE_ITEM_RE.match(rest.strip())
+                    if bare:
+                        labels.append(bare.group(1).strip())
+                continue
+            m = SAM3_CONCEPTS_LINE_RE.search(line)
+            if m:
+                labels.extend(SAM3_CONCEPT_ITEM_RE.findall(m.group(1)))
+    except Exception:
+        return labels
     return labels
 
 

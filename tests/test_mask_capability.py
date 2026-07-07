@@ -140,6 +140,13 @@ def test_parse_labels_tolerant():
     assert M.parse_labels("   detected: none\n") == []
     assert M.parse_labels("no matches here") == []
 
+def test_parse_labels_sam3_concepts():
+    out = "[sam3] 'the main subject': 1 instance(s) scores [0.52]\n[sam3] 2 instance(s) from concepts ['the main subject', 'bicycle']\n"
+    assert M.parse_labels(out) == ["the main subject", "bicycle"]
+
+def test_parse_labels_point_selection():
+    assert M.parse_labels("detected: point-selection 0.87") == ["point-selection"]
+
 def test_reconcile_mask_center_crops_and_pads():
     m = np.full((10, 12), 255, np.uint8)
     out = M.reconcile_mask(m, target_w=8, target_h=6)
