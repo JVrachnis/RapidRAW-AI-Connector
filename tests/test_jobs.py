@@ -171,3 +171,29 @@ async def test_startup_recovery_requeues_running(db, tmp_path):
     done = await wait_status(q, "j1", {"done"})
     assert done["result"] == {"ok": 1}
     await q.stop()
+
+@pytest.mark.asyncio
+async def test_workdir_removed_after_job_completes(db, tmp_path):
+    async def writes_file(ctx):
+        (ctx.workdir / "scratch.bin").write_bytes(b"x" * 10)
+        return {}
+    q = make_queue(db, tmp_path, {"w": writes_file})
+    await q.start()
+    j = q.submit("w", "s", {}, "interactive")
+    await wait_status(q, j["job_id"], {"done"})
+    await asyncio.sleep(0.05)  # let the finally block run
+    assert not (tmp_path / "jobs" / j["job_id"]).exists()
+    await q.stop()
+
+@pytest.mark.asyncio
+async def test_prune_sweeps_orphan_workdirs(db, tmp_path):
+    async def ok(ctx):
+        return {}
+    q = make_queue(db, tmp_path, {"k": ok})
+    orphan = tmp_path / "jobs" / "deadbeefdeadbeef"
+    orphan.mkdir(parents=True)
+    (orphan / "junk.png").write_bytes(b"j")
+    await q.start()
+    q._prune()
+    assert not orphan.exists()
+    await q.stop()

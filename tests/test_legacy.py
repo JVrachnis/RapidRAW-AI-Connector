@@ -58,3 +58,17 @@ def test_inpaint_roundtrip_with_mocked_comfy(client):
     decoded_mask = base64.b64decode(body["mask"])
     Image.open(io.BytesIO(decoded_color)).verify()
     Image.open(io.BytesIO(decoded_mask)).verify()
+
+
+def test_inpaint_error_bodies_are_single_line(client):
+    client.post("/upload_source",
+                files={"file": ("source.jpg", png_bytes(), "image/jpeg")},
+                data={"source_id": "errsrc"})
+    with patch("capabilities.inpaint.ComfyClient") as MockClient:
+        MockClient.return_value.execute = AsyncMock(side_effect=ConnectionError("comfy is down"))
+        r = client.post("/inpaint", json={
+            "source_id": "errsrc", "prompt": "x",
+            "mask_image_base64": base64.b64encode(png_bytes()).decode()})
+    assert r.status_code == 502
+    assert "\n" not in r.json()["detail"]
+    assert r.json()["detail"].startswith("ComfyUI Unavailable:")

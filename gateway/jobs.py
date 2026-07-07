@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shutil
 import signal
 import traceback
 import uuid
@@ -170,6 +171,13 @@ class JobQueue:
                 if ev.is_set() and self.db.query_one("SELECT 1 FROM jobs WHERE id=?", (jid,)) is None]
         for jid in dead:
             del self._done_events[jid]
+        # Sweep leftover workdirs whose job row no longer exists (e.g. left
+        # behind by a crash before the normal cleanup in _worker() ran).
+        if self.workdir_root.exists():
+            known_ids = {r["id"] for r in self.db.query("SELECT id FROM jobs")}
+            for child in self.workdir_root.iterdir():
+                if child.is_dir() and child.name not in known_ids:
+                    shutil.rmtree(child, ignore_errors=True)
 
     async def _worker(self):
         while True:
@@ -196,10 +204,12 @@ class JobQueue:
                 workdir=workdir, _queue=self))
             self._running_ctx = ctx
             self._running_task = asyncio.create_task(handler(ctx))
+            finished = False  # set True only when _finish() ran (a real terminal state)
             try:
                 result = await asyncio.wait_for(asyncio.shield(self._running_task),
                                                 timeout=self.job_timeout_s)
                 self._finish(job_id, "done", result=result)
+                finished = True
             except asyncio.TimeoutError:
                 self._running_task.cancel()
                 try:
@@ -209,6 +219,7 @@ class JobQueue:
                 self._cancelled_by_user.discard(job_id)  # a racing user-cancel lost to the timeout
                 self._finish(job_id, "error", error={"kind": "timeout",
                              "detail": f"exceeded {self.job_timeout_s}s"})
+                finished = True
             except asyncio.CancelledError:
                 if job_id in self._cancelled_by_user:
                     self._cancelled_by_user.discard(job_id)
@@ -218,13 +229,17 @@ class JobQueue:
                         pass
                     self._finish(job_id, "cancelled",
                                  error={"kind": "cancelled", "detail": "cancelled while running"})
+                    finished = True
                 else:
-                    raise  # queue itself is being stopped
+                    raise  # queue itself is being stopped; leave workdir for crash recovery
             except Exception as e:
                 self._cancelled_by_user.discard(job_id)  # a racing user-cancel lost to this error
                 self._finish(job_id, "error", error={
                     "kind": getattr(e, "kind", "handler_error"),
                     "detail": f"{e}\n{traceback.format_exc(limit=5)}"})
+                finished = True
             finally:
                 self._running_ctx = None
                 self._running_task = None
+                if finished:
+                    shutil.rmtree(workdir, ignore_errors=True)

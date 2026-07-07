@@ -41,6 +41,7 @@ async def inpaint(request: Request, req: InpaintPayload):
     if done["status"] == "done":
         return done["result"]
     err = done.get("error") or {}
+    detail = (err.get("detail") or "").splitlines()[0] if err.get("detail") else ""
     if err.get("kind") == "comfyui_down":
-        raise HTTPException(502, f"ComfyUI Unavailable: {err.get('detail')}")
-    raise HTTPException(500, f"Processing error: {err.get('detail')}")
+        raise HTTPException(502, f"ComfyUI Unavailable: {detail}")
+    raise HTTPException(500, f"Processing error: {detail}")
