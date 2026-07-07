@@ -66,11 +66,24 @@ class JobQueue:
         self._wake.set()
 
     async def stop(self):
+        # Capture the in-flight handler task BEFORE touching the worker loop:
+        # the worker's own CancelledError handling clears self._running_task
+        # in its `finally` block, so this reference would be lost otherwise.
+        handler_task = self._running_task
         if self._task:
             self._task.cancel()
             try:
                 await self._task
             except asyncio.CancelledError:
+                pass
+        # Terminate the handler task too, so no orphan keeps running after
+        # stop() returns. This must NOT go through the user-cancel path (the
+        # DB row must remain 'running' for crash recovery on the next start()).
+        if handler_task and not handler_task.done():
+            handler_task.cancel()
+            try:
+                await handler_task
+            except BaseException:
                 pass
 
     def submit(self, capability: str, source_id: str, params: dict, priority: str) -> dict:

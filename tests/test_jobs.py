@@ -93,6 +93,42 @@ async def test_cancel_queued(db, tmp_path):
     await q.stop()
 
 @pytest.mark.asyncio
+async def test_stop_terminates_running_handler_without_orphan(db, tmp_path):
+    started = asyncio.Event()
+    finished = []
+    async def hang(ctx):
+        started.set()
+        await asyncio.sleep(30)
+        finished.append(ctx.job_id)   # must never run after stop()
+        return {"late": True}
+    q = make_queue(db, tmp_path, {"h": hang})
+    await q.start()
+    j = q.submit("h", "s", {}, "interactive")
+    await asyncio.wait_for(started.wait(), 2)
+    handler_task = q._running_task
+    tasks_before = asyncio.all_tasks()
+    await q.stop()
+    await asyncio.sleep(0.1)          # give an orphan a chance to misbehave
+    # The in-flight handler task must be terminated (cancelled/done), not left
+    # running in the background as an orphan.
+    assert handler_task.done(), "handler task must not survive stop()"
+    orphans = [t for t in asyncio.all_tasks() - tasks_before if not t.done()]
+    assert orphans == [], f"orphan tasks still running after stop(): {orphans}"
+    assert finished == []             # no orphan completed
+    row = q.get(j["job_id"])
+    assert row["status"] == "running"  # left for crash recovery
+    # restart requeues and completes nothing (handler hangs), so just verify requeue:
+    q2 = make_queue(db, tmp_path, {"h": hang})
+    await q2.start()
+    for _ in range(100):
+        st = q2.get(j["job_id"])["status"]
+        if st == "running":
+            break
+        await asyncio.sleep(0.02)
+    assert q2.get(j["job_id"])["status"] in ("queued", "running")
+    await q2.stop()
+
+@pytest.mark.asyncio
 async def test_startup_recovery_requeues_running(db, tmp_path):
     db.execute("INSERT INTO jobs(id,capability,source_id,params,priority,status,created)"
                " VALUES('j1','x','s','{}','interactive','running',1.0)")
