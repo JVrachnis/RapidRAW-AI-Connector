@@ -20,6 +20,9 @@ def main():
     ap.add_argument("--out", default="mask.png")
     args = ap.parse_args()
 
+    if args.backend == "sam3":
+        print("warning: sam3 backend not wired for point prompts; using sam2")
+
     sys.path.insert(0, args.tools_dir)
     import grounded_sam as GS  # provides the cached SAM2 predictor plumbing
 

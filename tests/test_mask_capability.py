@@ -40,11 +40,16 @@ class ToolRecorder:
         if cmd[1].endswith("raw_develop.py"):
             # cmd = [py, raw_develop.py, RAW.ARW, OUTDIR, ...] per the tool's
             # documented CLI (RAW.ARW OUTDIR) -- outdir is the 4th element.
+            # Filenames mirror raw_develop.py's REAL output (verified on the
+            # GPU host): {base}_EV{ev:+g}.jpg, {base}_exif.json, and a
+            # {base}_stack.jpg montage that must never be picked as the
+            # working frame. No PNGs are ever produced.
             outdir = Path(cmd[3])
             outdir.mkdir(parents=True, exist_ok=True)
-            for ev in ("-2", "0", "2", "4"):
-                Image.new("RGB", (8, 6)).save(outdir / f"ev{ev}.png")
-            (outdir / "exif.json").write_text("{}")
+            for ev in ("-2", "+0", "+2", "+4"):
+                Image.new("RGB", (8, 6)).save(outdir / f"src_EV{ev}.jpg")
+            Image.new("RGB", (8, 6)).save(outdir / "src_stack.jpg")
+            (outdir / "src_exif.json").write_text("{}")
         return 0, "detected: person 0.91\n", ""
 
 @pytest.mark.asyncio
@@ -108,6 +113,9 @@ async def test_raw_source_develops_first_and_flags_alignment(tmp_path):
     result = await M.handle(ctx)
     assert rec.calls[0][1].endswith("raw_develop.py")
     assert rec.calls[1][1].endswith(("mask_hq.py",))
+    # The picker must select the EV closest to 0 (src_EV+0.jpg), never the
+    # _stack montage or an off-zero EV frame.
+    assert rec.calls[1][2].endswith("src_EV+0.jpg")
     assert result["alignment"] == "best_effort"
 
 @pytest.mark.asyncio
@@ -130,3 +138,53 @@ def test_reconcile_mask_center_crops_and_pads():
     out2 = M.reconcile_mask(m, target_w=14, target_h=12)
     assert out2.shape == (12, 14)
     assert out2[0, 0] == 0  # padded border
+
+
+def test_pick_base_frame_prefers_ev0_and_ignores_montage(tmp_path):
+    for name in ("a_EV-2.jpg", "a_EV+0.jpg", "a_EV+4.jpg", "a_stack.jpg", "a_exif.json"):
+        (tmp_path / name).write_bytes(b"x")
+    assert M.pick_base_frame(tmp_path).name == "a_EV+0.jpg"
+
+
+def test_pick_base_frame_closest_to_zero_when_no_exact(tmp_path):
+    for name in ("a_EV-2.jpg", "a_EV+2.jpg", "a_EV+4.jpg"):
+        (tmp_path / name).write_bytes(b"x")
+    assert M.pick_base_frame(tmp_path).name in ("a_EV-2.jpg", "a_EV+2.jpg")
+
+
+def test_pick_base_frame_empty_raises(tmp_path):
+    (tmp_path / "a_stack.jpg").write_bytes(b"x")
+    import pytest as _pytest
+    with _pytest.raises(RuntimeError):
+        M.pick_base_frame(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_tool_failure_classified_comfyui_down(tmp_path):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "x."})
+    async def failing(cmd, timeout=None):
+        return 1, "", "ConnectionRefused connecting to 127.0.0.1:8188"
+    ctx.run_tool = failing
+    with pytest.raises(RuntimeError) as ei:
+        await M.handle(ctx)
+    assert getattr(ei.value, "kind", None) == "comfyui_down"
+
+
+@pytest.mark.asyncio
+async def test_tool_failure_classified_tool_error(tmp_path):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "x."})
+    async def failing(cmd, timeout=None):
+        return 2, "", "torch OOM"
+    ctx.run_tool = failing
+    with pytest.raises(RuntimeError) as ei:
+        await M.handle(ctx)
+    assert getattr(ei.value, "kind", None) == "tool_error"
+
+
+@pytest.mark.asyncio
+async def test_nonraw_mask_upscaled_to_source_dims(tmp_path):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "x."}, dims=(16, 12))
+    rec = ToolRecorder()  # writes an 8x6 mask regardless
+    ctx.run_tool = rec
+    result = await M.handle(ctx)
+    assert (result["width"], result["height"]) == (16, 12)

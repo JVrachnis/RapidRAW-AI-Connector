@@ -40,6 +40,23 @@ PARAMS_SCHEMA = {
 }
 
 LABEL_RE = re.compile(r"detected:\s*([a-zA-Z][\w \-]*?)\s+[\d.]+", re.MULTILINE)
+EV_FRAME_RE = re.compile(r"_EV([+-]?[0-9.]+)\.(jpg|jpeg|png)$", re.IGNORECASE)
+
+
+def pick_base_frame(outdir: Path) -> Path:
+    """Pick the EV closest to 0 from raw_develop.py's output
+    ({base}_EV{ev:+g}.jpg), ignoring the _stack montage."""
+    best = None
+    for f in sorted(outdir.iterdir()):
+        m = EV_FRAME_RE.search(f.name)
+        if not m:
+            continue
+        ev = abs(float(m.group(1)))
+        if best is None or ev < best[0]:
+            best = (ev, f)
+    if best is None:
+        raise RuntimeError(f"raw_develop produced no EV frames in {outdir}")
+    return best[1]
 
 
 def parse_labels(stdout: str) -> list[str]:
@@ -83,10 +100,7 @@ async def _develop_raw(ctx) -> Path:
     code, out, err = await ctx.run_tool(cmd)
     if code != 0:
         raise RuntimeError(f"raw_develop failed: {err[-800:]}")
-    candidates = sorted(outdir.glob("*0*.png")) or sorted(outdir.glob("*.png"))
-    if not candidates:
-        raise RuntimeError("raw_develop produced no frames")
-    return candidates[0]
+    return pick_base_frame(outdir)
 
 
 async def handle(ctx) -> dict:
@@ -119,6 +133,10 @@ async def handle(ctx) -> dict:
         cmd = [py, _tool(settings, "mask_hq.py"), str(image_path),
                "--query", p["query"], "--out", str(out_path)]
     elif mode == "points":
+        # Points arrive in client (RapidRAW-decode) pixel space; for raw
+        # sources the developed frame may differ by a few pixels per edge,
+        # so edge clicks can drift by the half-margin -- spec-sanctioned
+        # best_effort; the TIFF payload path gives exact coords instead.
         cmd = [py, _bundled("mask_points.py"), str(image_path),
                "--points", json.dumps(p["points"]), "--backend", backend,
                "--tools-dir", settings.GATEWAY_TOOLS_DIR, "--out", str(out_path)]
