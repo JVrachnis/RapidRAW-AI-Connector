@@ -5,6 +5,7 @@ import base64
 import io
 import json
 import re
+import subprocess
 import time
 import numpy as np
 from pathlib import Path
@@ -133,12 +134,52 @@ def _bundled(name: str) -> str:
     return str(Path(__file__).parent / "mask_tools" / name)
 
 
-async def _develop_raw(ctx) -> Path:
+def parse_gpu_free(nvidia_smi_output: str) -> list[tuple[int, int]]:
+    """Parse `nvidia-smi --query-gpu=index,memory.free --format=csv,noheader,nounits`
+    output into [(index, free_mb)]. Tolerant: skip malformed lines."""
+    out = []
+    for line in nvidia_smi_output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 2:
+            continue
+        try:
+            out.append((int(parts[0]), int(parts[1])))
+        except ValueError:
+            continue
+    return out
+
+
+def pick_cuda_device(min_free_mb: int = 3000) -> "str | None":
+    """Return the index (as str) of the GPU with the most free VRAM, or None if
+    nvidia-smi is unavailable / no GPU has at least min_free_mb free (caller then
+    leaves the environment untouched)."""
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.free",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5)
+        if proc.returncode != 0:
+            return None
+        gpus = parse_gpu_free(proc.stdout)
+    except Exception:
+        return None
+    if not gpus:
+        return None
+    best_idx, best_free = max(gpus, key=lambda g: g[1])
+    if best_free < min_free_mb:
+        return None
+    return str(best_idx)
+
+
+async def _develop_raw(ctx, env: "dict | None" = None) -> Path:
     """raw_develop.py -> pick the 0EV frame as the working image."""
     outdir = ctx.workdir / "developed"
     cmd = [ctx.settings.GATEWAY_RAWTOOLS_PY, _tool(ctx.settings, "raw_develop.py"),
            str(ctx.source.path), str(outdir)]
-    code, out, err = await ctx.run_tool(cmd)
+    code, out, err = await ctx.run_tool(cmd, env=env)
     if code != 0:
         raise RuntimeError(f"raw_develop failed: {err[-800:]}")
     return pick_base_frame(outdir)
@@ -153,14 +194,27 @@ async def handle(ctx) -> dict:
     py = settings.GATEWAY_COMFY_VENV_PY
     alignment = "exact"
 
+    mode = p["mode"]
+    backend = p.get("backend", "sam2")
+    is_multirep = mode == "prompt" and backend == "sam3" and p.get("sam3_multirep")
+
+    # Dynamic per-job GPU selection: script-side tools (SAM2/SAM3/GroundingDINO/
+    # ViTMatte) default to cuda:0, which piles onto whichever card ComfyUI is
+    # using. Pin the freest GPU per job so masking work spreads across both
+    # cards. sam3_multirep's --sam3-parallel needs BOTH GPUs visible, so it is
+    # excluded and inherits the full environment (env=None).
+    tool_env = None
+    if not is_multirep:
+        gpu_idx = pick_cuda_device()
+        if gpu_idx is not None:
+            tool_env = {"CUDA_VISIBLE_DEVICES": gpu_idx}
+
     image_path = ctx.source.path
     if ctx.source.kind == "raw":
-        image_path = await _develop_raw(ctx)
+        image_path = await _develop_raw(ctx, env=tool_env)
         alignment = "best_effort"
 
     out_path = ctx.workdir / "mask.png"
-    mode = p["mode"]
-    backend = p.get("backend", "sam2")
 
     if mode == "prompt" and p.get("agentic"):
         target = p["query"]
@@ -205,7 +259,7 @@ async def handle(ctx) -> dict:
             cmd = [py, _tool(settings, "mask_hq.py"), str(image_path),
                    "--no-sam", "--query", "foreground.", "--out", str(out_path)]
 
-    code, stdout, stderr = await ctx.run_tool(cmd)
+    code, stdout, stderr = await ctx.run_tool(cmd, env=tool_env)
     if code != 0:
         kind = "comfyui_down" if "ComfyUI" in stderr or "8188" in stderr else "tool_error"
         e = RuntimeError(f"mask tool failed: {stderr[-800:]}")

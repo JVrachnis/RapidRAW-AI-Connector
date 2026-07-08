@@ -186,6 +186,25 @@ async def test_workdir_removed_after_job_completes(db, tmp_path):
     await q.stop()
 
 @pytest.mark.asyncio
+async def test_run_tool_applies_env(db, tmp_path):
+    import sys
+    result = {}
+    async def runs_tool(ctx: JobContext):
+        code, out, err = await ctx.run_tool(
+            [sys.executable, "-c", "import os;print(os.environ.get('X_TEST_VAR',''))"],
+            env={"X_TEST_VAR": "hi"})
+        result["code"] = code
+        result["out"] = out
+        return {}
+    q = make_queue(db, tmp_path, {"e": runs_tool})
+    await q.start()
+    j = q.submit("e", "s", {}, "interactive")
+    await wait_status(q, j["job_id"], {"done"})
+    assert result["code"] == 0
+    assert result["out"].strip() == "hi"
+    await q.stop()
+
+@pytest.mark.asyncio
 async def test_prune_sweeps_orphan_workdirs(db, tmp_path):
     async def ok(ctx):
         return {}

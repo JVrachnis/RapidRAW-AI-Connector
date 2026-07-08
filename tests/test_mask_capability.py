@@ -32,7 +32,7 @@ class ToolRecorder:
     def __init__(self, mask_val=200):
         self.calls = []
         self.mask_val = mask_val
-    async def __call__(self, cmd, timeout=None):
+    async def __call__(self, cmd, timeout=None, env=None):
         self.calls.append(cmd)
         if "--out" in cmd:
             out = Path(cmd[cmd.index("--out") + 1])
@@ -178,7 +178,7 @@ def test_pick_base_frame_empty_raises(tmp_path):
 @pytest.mark.asyncio
 async def test_tool_failure_classified_comfyui_down(tmp_path):
     ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "x."})
-    async def failing(cmd, timeout=None):
+    async def failing(cmd, timeout=None, env=None):
         return 1, "", "ConnectionRefused connecting to 127.0.0.1:8188"
     ctx.run_tool = failing
     with pytest.raises(RuntimeError) as ei:
@@ -189,7 +189,7 @@ async def test_tool_failure_classified_comfyui_down(tmp_path):
 @pytest.mark.asyncio
 async def test_tool_failure_classified_tool_error(tmp_path):
     ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "x."})
-    async def failing(cmd, timeout=None):
+    async def failing(cmd, timeout=None, env=None):
         return 2, "", "torch OOM"
     ctx.run_tool = failing
     with pytest.raises(RuntimeError) as ei:
@@ -231,3 +231,39 @@ async def test_prompt_default_backend_still_mask_hq(tmp_path):
     rec = ToolRecorder(); ctx.run_tool = rec
     await M.handle(ctx)
     assert rec.calls[0][1].endswith("mask_hq.py")
+
+
+def test_parse_gpu_free():
+    out = "0, 14876\n1, 6512\n"
+    assert M.parse_gpu_free(out) == [(0, 14876), (1, 6512)]
+    assert M.parse_gpu_free("garbage\n0, 100\n") == [(0, 100)]
+    assert M.parse_gpu_free("") == []
+
+
+@pytest.mark.asyncio
+async def test_tool_env_pins_freest_gpu(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "x.", "backend": "sam3"})
+    rec = ToolRecorder()
+    envs = []
+    async def rec_env(cmd, timeout=None, env=None):
+        envs.append(env)
+        return await rec(cmd, timeout)
+    ctx.run_tool = rec_env
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "1")
+    await M.handle(ctx)
+    assert envs[-1] == {"CUDA_VISIBLE_DEVICES": "1"}
+
+
+@pytest.mark.asyncio
+async def test_multirep_keeps_both_gpus_visible(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "x.", "backend": "sam3",
+                              "sam3_multirep": True})
+    rec = ToolRecorder()
+    envs = []
+    async def rec_env(cmd, timeout=None, env=None):
+        envs.append(env)
+        return await rec(cmd, timeout)
+    ctx.run_tool = rec_env
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "1")
+    await M.handle(ctx)
+    assert envs[-1] is None

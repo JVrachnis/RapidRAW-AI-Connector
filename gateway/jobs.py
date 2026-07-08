@@ -23,12 +23,15 @@ class JobContext:
     def set_progress(self, fraction: float) -> None:
         self._queue._set_progress(self.job_id, fraction)
 
-    async def run_tool(self, cmd: list[str], timeout: Optional[float] = None) -> tuple[int, str, str]:
+    async def run_tool(self, cmd: list[str], timeout: Optional[float] = None,
+                       env: Optional[dict] = None) -> tuple[int, str, str]:
         """Run a subprocess in its own process group so cancel/timeout can kill the tree.
-        Returns (returncode, stdout, stderr)."""
+        Returns (returncode, stdout, stderr). When `env` is given, the subprocess
+        gets the gateway's own environment merged with `env` (caller's keys win)."""
         proc = await asyncio.create_subprocess_exec(
             *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            preexec_fn=os.setsid)
+            preexec_fn=os.setsid,
+            env={**os.environ, **env} if env is not None else None)
         self._proc = proc
         try:
             out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
