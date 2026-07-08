@@ -40,6 +40,11 @@ class Settings(BaseSettings):
     GATEWAY_INTENT_LLM: str = "gemma3:4b"
     GATEWAY_VLM_URL: str = "http://127.0.0.1:11434/v1/chat/completions"
     GATEWAY_VLM_MODEL: str = "minicpm-v4.5:q4_K_M"
+    # Persistent mask worker (Phase 2): "auto" probes/spawns the resident SAM3
+    # worker for eligible sam3 jobs and falls back to the subprocess path on any
+    # failure; "off" always uses the subprocess path.
+    GATEWAY_WORKER: str = "auto"
+    GATEWAY_WORKER_URL: str = "http://127.0.0.1:5101"
 
     @property
     def gateway_db_path(self) -> Path:

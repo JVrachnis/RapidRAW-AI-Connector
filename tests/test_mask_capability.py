@@ -14,7 +14,8 @@ from capabilities import mask as M
 def gray_png(path: Path, w=8, h=6, val=200):
     Image.new("L", (w, h), val).save(path)
 
-def make_ctx(tmp_path, params, kind="tiff", exif=None, rrdata=None, dims=(8, 6)):
+def make_ctx(tmp_path, params, kind="tiff", exif=None, rrdata=None, dims=(8, 6),
+             worker="off"):
     src_path = tmp_path / ("src.tiff" if kind == "tiff" else "src.arw")
     if kind == "tiff":
         Image.new("RGB", dims, (50, 60, 70)).save(src_path, "TIFF")
@@ -25,7 +26,11 @@ def make_ctx(tmp_path, params, kind="tiff", exif=None, rrdata=None, dims=(8, 6))
     ctx = JobContext(job_id="j1", source_id="s1", params=params, workdir=workdir)
     ctx.source = SourceRecord(source_id="s1", path=src_path, kind=kind,
                               width=dims[0], height=dims[1], exif=exif, rrdata=rrdata)
-    ctx.settings = Settings(CACHE_DIR=tmp_path)
+    # Default the persistent worker OFF so the many subprocess-command-shape
+    # assertions below exercise the subprocess path deterministically. The
+    # worker path is covered by its own tests, which opt in with worker="auto"
+    # and monkeypatch the worker-client seams.
+    ctx.settings = Settings(CACHE_DIR=tmp_path, GATEWAY_WORKER=worker)
     return ctx
 
 class ToolRecorder:
@@ -669,7 +674,7 @@ def make_ctx_shared_source(tmp_path, params, src_path, dims=(8, 6), job_name="jo
     ctx = JobContext(job_id=job_name, source_id="s1", params=params, workdir=workdir)
     ctx.source = SourceRecord(source_id="s1", path=src_path, kind="tiff",
                               width=dims[0], height=dims[1], exif=None, rrdata=None)
-    ctx.settings = Settings(CACHE_DIR=tmp_path)
+    ctx.settings = Settings(CACHE_DIR=tmp_path, GATEWAY_WORKER="off")
     return ctx
 
 
@@ -740,3 +745,154 @@ async def test_depth_cache_hit_skips_tool_and_reports_depth_used(tmp_path, monke
     assert "--depth-map" in cmd
     assert cmd[cmd.index("--depth-map") + 1] == str(depth_cache)
     assert result["depth_used"] is True
+
+
+# ------------------------------------------------------------------
+# Persistent mask worker (Phase 2) -- gateway side. The worker's HTTP is mocked
+# by monkeypatching the worker_client seams (ensure_worker / call_worker), so no
+# real worker or GPU is needed. The worker writes the mask PNG to out_path; the
+# fakes below emulate that.
+# ------------------------------------------------------------------
+from capabilities.mask_tools import worker_client as WC
+
+
+def _fake_ensure_worker_ok(*a, **k):
+    async def _e(settings, cache_dir):
+        return True
+    return _e
+
+
+@pytest.mark.asyncio
+async def test_eligible_job_uses_worker_and_skips_subprocess(tmp_path, monkeypatch):
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+
+    async def fake_ensure(settings, cache_dir):
+        return True
+
+    async def fake_call(url, payload, timeout):
+        # Emulate the worker writing the grayscale mask to out_path.
+        gray_png(Path(payload["out_path"]), val=180)
+        return {"ok": True, "out_path": payload["out_path"], "coverage": 0.12,
+                "cached_detections": False, "timings": {"total_s": 3.1}}
+
+    monkeypatch.setattr(WC, "ensure_worker", fake_ensure)
+    monkeypatch.setattr(WC, "call_worker", fake_call)
+
+    ctx = make_ctx(tmp_path, {"mode": "box", "box": [1, 1, 5, 4], "backend": "sam3"},
+                   worker="auto")
+    rec = ToolRecorder(); ctx.run_tool = rec
+    result = await M.handle(ctx)
+
+    # No subprocess mask tool call (make_depth may run for carve, but this job
+    # has no carve, so rec.calls must be entirely empty).
+    assert rec.calls == []
+    assert result["worker"] is True
+    assert result["cached_detections"] is False
+    img = Image.open(io.BytesIO(base64.b64decode(result["mask_png_b64"])))
+    assert img.size == (8, 6) and img.mode == "L"
+
+
+@pytest.mark.asyncio
+async def test_worker_error_falls_back_to_subprocess(tmp_path, monkeypatch):
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+
+    async def fake_ensure(settings, cache_dir):
+        return True
+
+    async def fake_call(url, payload, timeout):
+        raise RuntimeError("worker error 500: boom")
+
+    monkeypatch.setattr(WC, "ensure_worker", fake_ensure)
+    monkeypatch.setattr(WC, "call_worker", fake_call)
+
+    ctx = make_ctx(tmp_path, {"mode": "box", "box": [1, 1, 5, 4], "backend": "sam3"},
+                   worker="auto")
+    rec = ToolRecorder(); ctx.run_tool = rec
+    result = await M.handle(ctx)
+
+    # Fell back: the subprocess mask_c2f.py path ran, result.worker is False,
+    # and the job still succeeded.
+    assert result["worker"] is False
+    assert rec.calls and rec.calls[0][1].endswith("mask_c2f.py")
+    img = Image.open(io.BytesIO(base64.b64decode(result["mask_png_b64"])))
+    assert img.size == (8, 6)
+
+
+@pytest.mark.asyncio
+async def test_worker_off_never_probes(tmp_path, monkeypatch):
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    called = {"ensure": 0}
+
+    async def fake_ensure(settings, cache_dir):
+        called["ensure"] += 1
+        return True
+
+    monkeypatch.setattr(WC, "ensure_worker", fake_ensure)
+
+    ctx = make_ctx(tmp_path, {"mode": "box", "box": [1, 1, 5, 4], "backend": "sam3"},
+                   worker="off")
+    rec = ToolRecorder(); ctx.run_tool = rec
+    result = await M.handle(ctx)
+
+    assert called["ensure"] == 0            # no probe at all
+    assert result["worker"] is False
+    assert rec.calls[0][1].endswith("mask_c2f.py")
+
+
+@pytest.mark.asyncio
+async def test_agentic_job_ineligible_no_probe(tmp_path, monkeypatch):
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    called = {"ensure": 0}
+
+    async def fake_ensure(settings, cache_dir):
+        called["ensure"] += 1
+        return True
+
+    monkeypatch.setattr(WC, "ensure_worker", fake_ensure)
+
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "gear", "agentic": True,
+                              "backend": "sam3"}, worker="auto")
+    rec = ToolRecorder(); ctx.run_tool = rec
+    result = await M.handle(ctx)
+
+    assert called["ensure"] == 0            # agentic is ineligible -> no probe
+    assert result["worker"] is False
+    assert rec.calls[0][1].endswith("mask_agentic.py")
+
+
+@pytest.mark.asyncio
+async def test_points_and_sam2_ineligible_no_probe(tmp_path, monkeypatch):
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    called = {"ensure": 0}
+
+    async def fake_ensure(settings, cache_dir):
+        called["ensure"] += 1
+        return True
+
+    monkeypatch.setattr(WC, "ensure_worker", fake_ensure)
+
+    d1 = tmp_path / "a"; d1.mkdir()
+    d2 = tmp_path / "b"; d2.mkdir()
+    # points -> SAM2 tool, ineligible
+    ctx = make_ctx(d1, {"mode": "points", "points": [[1, 1, 1]],
+                        "backend": "sam2"}, worker="auto")
+    ctx.run_tool = ToolRecorder()
+    await M.handle(ctx)
+    # sam2 box -> ineligible
+    ctx2 = make_ctx(d2, {"mode": "box", "box": [1, 1, 5, 4], "backend": "sam2"},
+                    worker="auto")
+    ctx2.run_tool = ToolRecorder()
+    await M.handle(ctx2)
+
+    assert called["ensure"] == 0            # neither eligible -> no probe
+
+
+def test_worker_eligibility_matrix():
+    elig = WC.is_worker_eligible
+    assert elig({"mode": "prompt", "backend": "sam3"})
+    assert elig({"mode": "box", "backend": "sam3"})
+    assert elig({"mode": "paint", "backend": "sam3"})
+    assert not elig({"mode": "prompt", "backend": "sam3", "agentic": True})
+    assert not elig({"mode": "points", "backend": "sam3"})
+    assert not elig({"mode": "prompt", "backend": "sam2"})
+    assert not elig({"mode": "preset", "backend": "sam3"})

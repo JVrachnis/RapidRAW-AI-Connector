@@ -13,6 +13,7 @@ import numpy as np
 from pathlib import Path
 from PIL import Image, ImageDraw
 from gateway.registry import Capability, register
+from capabilities.mask_tools import worker_client
 
 logger = logging.getLogger("Mask")
 
@@ -319,6 +320,50 @@ def _build_agentic_cmd(py, settings, image_path, out_path, target, backend,
     return cmd, tool_env
 
 
+async def _try_worker(ctx, image_path, out_path, mode, carve, depth_used, depth_path):
+    """For an eligible sam3 job, try the resident worker (probe/spawn -> POST
+    /mask). Returns the worker's result dict on success, or None to signal the
+    caller to fall back to the subprocess path. NEVER raises: any failure
+    (spawn, health, request, bad response) is logged and turns into None, so the
+    behaviour-change risk of enabling the worker is zero -- the subprocess path
+    always remains the safety net."""
+    settings = ctx.settings
+    p = ctx.params
+    if settings.GATEWAY_WORKER == "off":
+        return None
+    if not worker_client.is_worker_eligible(p):
+        return None
+    try:
+        cache_dir = Path(settings.CACHE_DIR)
+        healthy = await worker_client.ensure_worker(settings, cache_dir)
+        if not healthy:
+            logger.warning("mask worker not available; falling back to subprocess")
+            return None
+
+        payload = {
+            "image_path": str(image_path),
+            "source_id": ctx.source.source_id,
+            "query": p.get("query") or "the main subject.",
+            "carve": bool(carve),
+            "multirep": bool(p.get("sam3_multirep")),
+            "out_path": str(out_path),
+            "mode": p.get("agentic_mode", "precise"),
+        }
+        if depth_used and depth_path is not None:
+            payload["depth_path"] = str(depth_path)
+        if mode == "box":
+            payload["box"] = p["box"]
+        elif mode == "paint":
+            payload["roi_png_b64"] = p["roi_mask_b64"]
+
+        data = await worker_client.call_worker(
+            settings.GATEWAY_WORKER_URL, payload, timeout=settings.GATEWAY_JOB_TIMEOUT_S)
+        return data
+    except Exception as e:
+        logger.warning("mask worker request failed (%s); falling back to subprocess", e)
+        return None
+
+
 async def handle(ctx) -> dict:
     t0 = time.perf_counter()
     if ctx.source is None:
@@ -360,6 +405,17 @@ async def handle(ctx) -> dict:
     if carve:
         depth_path = await _make_depth(ctx, image_path, env=tool_env)
         depth_used = depth_path is not None
+
+    # Persistent-worker fast path (Phase 2): eligible sam3 jobs (prompt/box/paint,
+    # non-agentic) try the resident worker, which holds models + per-source
+    # detections so a nudged box/ROI replays in ~2-4s. ANY failure -> None ->
+    # fall through to the subprocess path below (zero behaviour-change risk).
+    worker_result = await _try_worker(
+        ctx, image_path, out_path, mode, carve, depth_used, depth_path)
+    if worker_result is not None:
+        return _build_mask_result(
+            ctx, out_path, alignment, depth_used, t0, labels=[],
+            worker=True, cached_detections=worker_result.get("cached_detections"))
 
     if mode == "prompt" and p.get("agentic"):
         target = p["query"]
@@ -454,6 +510,17 @@ async def handle(ctx) -> dict:
         e.kind = kind
         raise e
 
+    return _build_mask_result(ctx, out_path, alignment, depth_used, t0,
+                              labels=parse_labels(stdout), worker=False)
+
+
+def _build_mask_result(ctx, out_path, alignment, depth_used, t0, labels,
+                       worker, cached_detections=None):
+    """Shared result builder: read the grayscale mask PNG written to out_path
+    (by either the subprocess tool or the resident worker), reconcile it to the
+    source dims, and pack the base64 result. `worker` records which path served
+    the job; `cached_detections` (worker path only) passes through whether the
+    worker replayed cached per-source detections."""
     mask = np.array(Image.open(out_path).convert("L"))
     tw, th = ctx.source.width, ctx.source.height
     if tw and th and (mask.shape[1], mask.shape[0]) != (tw, th):
@@ -466,14 +533,18 @@ async def handle(ctx) -> dict:
 
     buf = io.BytesIO()
     Image.fromarray(mask).save(buf, "PNG")
-    return {
+    result = {
         "mask_png_b64": base64.b64encode(buf.getvalue()).decode(),
         "width": int(mask.shape[1]), "height": int(mask.shape[0]),
-        "labels": parse_labels(stdout),
+        "labels": labels,
         "alignment": alignment,
         "depth_used": depth_used,
+        "worker": bool(worker),
         "timings": {"total_s": round(time.perf_counter() - t0, 2)},
     }
+    if cached_detections is not None:
+        result["cached_detections"] = bool(cached_detections)
+    return result
 
 
 register(Capability(
