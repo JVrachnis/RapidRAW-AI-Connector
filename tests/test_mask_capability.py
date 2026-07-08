@@ -140,6 +140,97 @@ async def test_box_mode_with_points_passes_both(tmp_path):
     assert pts == [[50, 50, 1]]
 
 @pytest.mark.asyncio
+async def test_box_sam3_routes_to_c2f_with_roi(tmp_path):
+    ctx = make_ctx(tmp_path, {"mode": "box", "box": [1, 1, 5, 4], "backend": "sam3"})
+    rec = ToolRecorder(); ctx.run_tool = rec
+    await M.handle(ctx)
+    cmd = rec.calls[0]
+    assert cmd[1].endswith("mask_c2f.py")
+    roi_arg = cmd[cmd.index("--roi") + 1]
+    assert Path(roi_arg).exists()
+    assert cmd[cmd.index("--query") + 1] == "the main subject."
+    assert cmd[cmd.index("--backend") + 1] == "sam3"
+
+
+@pytest.mark.asyncio
+async def test_box_sam3_custom_query_passthrough(tmp_path):
+    ctx = make_ctx(tmp_path, {"mode": "box", "box": [1, 1, 5, 4], "backend": "sam3",
+                              "query": "the bmx bike and rider."})
+    rec = ToolRecorder(); ctx.run_tool = rec
+    await M.handle(ctx)
+    cmd = rec.calls[0]
+    assert cmd[1].endswith("mask_c2f.py")
+    assert cmd[cmd.index("--query") + 1] == "the bmx bike and rider."
+
+
+@pytest.mark.asyncio
+async def test_box_sam3_carve_applies_shared_flags(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path, {"mode": "box", "box": [1, 1, 5, 4], "backend": "sam3",
+                              "carve": True})
+    rec = ToolRecorder(); ctx.run_tool = rec
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    result = await M.handle(ctx)
+    assert rec.calls[0][1].endswith("make_depth.py")
+    cmd = rec.calls[1]
+    assert cmd[1].endswith("mask_c2f.py")
+    assert "--sam3-carve" in cmd and "--depth-map" in cmd
+    assert result["depth_used"] is True
+
+
+@pytest.mark.asyncio
+async def test_box_sam3_multirep_flags(tmp_path):
+    ctx = make_ctx(tmp_path, {"mode": "box", "box": [1, 1, 5, 4], "backend": "sam3",
+                              "sam3_multirep": True})
+    rec = ToolRecorder(); ctx.run_tool = rec
+    await M.handle(ctx)
+    cmd = rec.calls[0]
+    assert "--sam3-multirep" in cmd and "--sam3-parallel" in cmd
+
+
+@pytest.mark.asyncio
+async def test_box_agentic_routes_to_mask_agentic_with_roi(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path, {"mode": "box", "box": [1, 1, 5, 4], "agentic": True,
+                              "query": "the bmx bike and rider.", "backend": "sam3"})
+    rec = ToolRecorder(); envs = []
+    async def rec_env(cmd, timeout=None, env=None):
+        envs.append(env); return await rec(cmd, timeout)
+    ctx.run_tool = rec_env
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    await M.handle(ctx)
+    cmd = rec.calls[0]
+    assert cmd[1].endswith("mask_agentic.py")
+    roi_arg = cmd[cmd.index("--roi") + 1]
+    assert Path(roi_arg).exists()
+    assert cmd[cmd.index("--target") + 1] == "the bmx bike and rider."
+    assert cmd[cmd.index("--backend") + 1] == "sam3"
+    env = envs[-1]
+    assert env["VLM_MODEL"] == "minicpm-v4.5:q4_K_M"
+
+
+@pytest.mark.asyncio
+async def test_box_agentic_default_query_when_missing(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path, {"mode": "box", "box": [1, 1, 5, 4], "agentic": True})
+    rec = ToolRecorder(); ctx.run_tool = rec
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    await M.handle(ctx)
+    cmd = rec.calls[0]
+    assert cmd[1].endswith("mask_agentic.py")
+    assert cmd[cmd.index("--target") + 1] == "the main subject."
+
+
+@pytest.mark.asyncio
+async def test_box_sam2_default_backend_unchanged(tmp_path):
+    # backend defaults to sam2 -- box mode keeps routing to bare
+    # mask_points.py --box, the pre-existing (mediocre but simple) behavior.
+    ctx = make_ctx(tmp_path, {"mode": "box", "box": [10, 20, 110, 220]})
+    rec = ToolRecorder(); ctx.run_tool = rec
+    await M.handle(ctx)
+    cmd = rec.calls[0]
+    assert cmd[1].endswith("mask_points.py")
+    assert cmd[cmd.index("--box") + 1] == "10,20,110,220"
+
+
+@pytest.mark.asyncio
 async def test_preset_subject(tmp_path):
     ctx = make_ctx(tmp_path, {"mode": "preset", "preset": "subject"})
     rec = ToolRecorder(); ctx.run_tool = rec
@@ -259,6 +350,31 @@ def test_reconcile_mask_center_crops_and_pads():
     out2 = M.reconcile_mask(m, target_w=14, target_h=12)
     assert out2.shape == (12, 14)
     assert out2[0, 0] == 0  # padded border
+
+
+def test_box_to_roi_png_white_inside_black_outside():
+    png_bytes = M.box_to_roi_png([10, 20, 30, 45], width=100, height=80)
+    img = Image.open(io.BytesIO(png_bytes))
+    assert img.mode == "L"
+    assert img.size == (100, 80)
+    arr = np.array(img)
+    # inside the box
+    assert arr[30, 20] == 255
+    assert arr[44, 29] == 255
+    # outside the box
+    assert arr[0, 0] == 0
+    assert arr[79, 99] == 0
+    assert arr[19, 10] == 0
+
+
+def test_box_to_roi_png_clamps_out_of_bounds_box():
+    # box extends past image bounds -- must clamp, not raise or wrap.
+    png_bytes = M.box_to_roi_png([-10, -10, 200, 200], width=50, height=40)
+    img = Image.open(io.BytesIO(png_bytes))
+    assert img.size == (50, 40)
+    arr = np.array(img)
+    assert arr[20, 25] == 255
+    assert arr[0, 0] == 255  # box covers whole clamped image
 
 
 def test_pick_base_frame_prefers_ev0_and_ignores_montage(tmp_path):

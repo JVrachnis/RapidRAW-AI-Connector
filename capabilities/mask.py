@@ -10,7 +10,7 @@ import subprocess
 import time
 import numpy as np
 from pathlib import Path
-from PIL import Image
+from PIL import Image, ImageDraw
 from gateway.registry import Capability, register
 
 logger = logging.getLogger("Mask")
@@ -226,6 +226,29 @@ async def classify_tool_failure(stderr: str) -> str:
     return "tool_error"
 
 
+def box_to_roi_png(box: "list | tuple", width: int, height: int) -> bytes:
+    """Render a box selection [x0, y0, x1, y1] as a coarse ROI mask: a white
+    filled rectangle on black, uint8 L-mode PNG at the source dims. The box
+    is clamped to the image bounds so out-of-range client coordinates never
+    raise or wrap. This is how box selections become a REGION HINT for the
+    full SAM3/agentic pipeline (mask_c2f.py / mask_agentic.py --roi), instead
+    of a bare SAM2 box prompt."""
+    x0, y0, x1, y1 = box
+    x0 = max(0, min(int(round(x0)), width))
+    x1 = max(0, min(int(round(x1)), width))
+    y0 = max(0, min(int(round(y0)), height))
+    y1 = max(0, min(int(round(y1)), height))
+    x0, x1 = sorted((x0, x1))
+    y0, y1 = sorted((y0, y1))
+    img = Image.new("L", (width, height), 0)
+    draw = ImageDraw.Draw(img)
+    if x1 > x0 and y1 > y0:
+        draw.rectangle([x0, y0, x1 - 1, y1 - 1], fill=255)
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
 def _apply_sam3_carve_flags(cmd: list, carve: bool, depth_used: bool, depth_path) -> None:
     """Append --sam3-carve/--depth-map to a mask_c2f.py command, shared by
     the direct sam3 prompt branch and the sam3-backed preset branch."""
@@ -242,6 +265,32 @@ PRESET_QUERIES = {
 }
 
 
+def _build_agentic_cmd(py, settings, image_path, out_path, target, backend,
+                        carve, depth_used, depth_path, agentic_mode, tool_env,
+                        roi_path=None):
+    """Shared mask_agentic.py invocation plumbing, used by both prompt+agentic
+    and box+agentic (the box case additionally restricts the search via
+    --roi). Returns (cmd, tool_env) since agentic runs need the LLM/VLM env
+    merged in on top of any GPU pin."""
+    cmd = [py, _tool(settings, "mask_agentic.py"), str(image_path),
+           "--target", target, "--backend", backend, "--out", str(out_path)]
+    if roi_path is not None:
+        cmd += ["--roi", str(roi_path)]
+    if carve:
+        cmd.append("--carve")
+    if depth_used:
+        cmd += ["--depth-map", str(depth_path)]
+    cmd += ["--mode", agentic_mode]
+    agentic_env = {
+        "LLM_URL": settings.GATEWAY_LLM_URL,
+        "INTENT_LLM": settings.GATEWAY_INTENT_LLM,
+        "VLM_URL": settings.GATEWAY_VLM_URL,
+        "VLM_MODEL": settings.GATEWAY_VLM_MODEL,
+    }
+    tool_env = {**agentic_env, **(tool_env or {})}
+    return cmd, tool_env
+
+
 async def handle(ctx) -> dict:
     t0 = time.perf_counter()
     if ctx.source is None:
@@ -253,7 +302,8 @@ async def handle(ctx) -> dict:
 
     mode = p["mode"]
     backend = p.get("backend", "sam2")
-    is_multirep = mode == "prompt" and backend == "sam3" and p.get("sam3_multirep")
+    is_multirep = (mode in ("prompt", "box") and backend == "sam3"
+                   and p.get("sam3_multirep"))
 
     # Dynamic per-job GPU selection: script-side tools (SAM2/SAM3/GroundingDINO/
     # ViTMatte) default to cuda:0, which piles onto whichever card ComfyUI is
@@ -289,20 +339,9 @@ async def handle(ctx) -> dict:
         tags = rr.get("tags") or []
         if tags:
             target = f"{target} (photo context: {', '.join(tags)})"
-        cmd = [py, _tool(settings, "mask_agentic.py"), str(image_path),
-               "--target", target, "--backend", backend, "--out", str(out_path)]
-        if carve:
-            cmd.append("--carve")
-        if depth_used:
-            cmd += ["--depth-map", str(depth_path)]
-        cmd += ["--mode", p.get("agentic_mode", "precise")]
-        agentic_env = {
-            "LLM_URL": settings.GATEWAY_LLM_URL,
-            "INTENT_LLM": settings.GATEWAY_INTENT_LLM,
-            "VLM_URL": settings.GATEWAY_VLM_URL,
-            "VLM_MODEL": settings.GATEWAY_VLM_MODEL,
-        }
-        tool_env = {**agentic_env, **(tool_env or {})}
+        cmd, tool_env = _build_agentic_cmd(
+            py, settings, image_path, out_path, target, backend,
+            carve, depth_used, depth_path, p.get("agentic_mode", "precise"), tool_env)
     elif mode == "prompt" and backend == "sam3":
         cmd = [py, _tool(settings, "mask_c2f.py"), str(image_path),
                "--query", p["query"], "--backend", "sam3",
@@ -321,7 +360,32 @@ async def handle(ctx) -> dict:
         cmd = [py, _bundled("mask_points.py"), str(image_path),
                "--points", json.dumps(p["points"]), "--backend", backend,
                "--tools-dir", settings.GATEWAY_TOOLS_DIR, "--out", str(out_path)]
+    elif mode == "box" and p.get("agentic"):
+        # A box is a REGION HINT, not a bare SAM2 box prompt: render it as a
+        # coarse ROI mask and route through the same full agentic pipeline as
+        # prompt+agentic, restricting the search to the box's interior.
+        roi_path = ctx.workdir / "roi.png"
+        roi_path.write_bytes(box_to_roi_png(p["box"], ctx.source.width, ctx.source.height))
+        target = p.get("query") or "the main subject."
+        cmd, tool_env = _build_agentic_cmd(
+            py, settings, image_path, out_path, target, backend,
+            carve, depth_used, depth_path, p.get("agentic_mode", "precise"), tool_env,
+            roi_path=roi_path)
+    elif mode == "box" and backend == "sam3":
+        # Same region-hint treatment for the non-agentic sam3 path: mask_c2f.py
+        # --roi restricts SAM3's search to the box instead of a bare SAM2 box
+        # prompt via mask_points.py.
+        roi_path = ctx.workdir / "roi.png"
+        roi_path.write_bytes(box_to_roi_png(p["box"], ctx.source.width, ctx.source.height))
+        cmd = [py, _tool(settings, "mask_c2f.py"), str(image_path),
+               "--query", p.get("query") or "the main subject.",
+               "--roi", str(roi_path), "--backend", "sam3",
+               "--birefnet-mode", "auto", "--out", str(out_path)]
+        if p.get("sam3_multirep"):
+            cmd += ["--sam3-multirep", "--sam3-parallel"]
+        _apply_sam3_carve_flags(cmd, carve, depth_used, depth_path)
     elif mode == "box":
+        # sam2 (default): unchanged, bare SAM2 box prompt via mask_points.py.
         # Same pixel-space caveats as "points" (raw sources: best_effort).
         cmd = [py, _bundled("mask_points.py"), str(image_path),
                "--box", ",".join(str(v) for v in p["box"]), "--backend", backend,
