@@ -39,7 +39,7 @@ class Settings(BaseSettings):
     GATEWAY_LLM_URL: str = "http://127.0.0.1:11434/v1/chat/completions"
     GATEWAY_INTENT_LLM: str = "gemma3:4b"
     GATEWAY_VLM_URL: str = "http://127.0.0.1:11434/v1/chat/completions"
-    GATEWAY_VLM_MODEL: str = "qwen3-vl:4b-instruct-q8_0"
+    GATEWAY_VLM_MODEL: str = "minicpm-v4.5:q4_K_M"
 
     @property
     def gateway_db_path(self) -> Path:

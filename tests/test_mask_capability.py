@@ -279,11 +279,14 @@ async def test_agentic_carve_and_mode_flags(tmp_path, monkeypatch):
     ctx.run_tool = rec_env
     monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
     await M.handle(ctx)
-    cmd = rec.calls[0]
+    # carve=True runs the bundled depth tool first, then mask_agentic.py.
+    assert rec.calls[0][1].endswith("make_depth.py")
+    cmd = rec.calls[1]
+    assert cmd[1].endswith("mask_agentic.py")
     assert "--carve" in cmd
     assert cmd[cmd.index("--mode") + 1] == "removal"
     env = envs[-1]
-    assert env["VLM_MODEL"] == "qwen3-vl:4b-instruct-q8_0"
+    assert env["VLM_MODEL"] == "minicpm-v4.5:q4_K_M"
     assert env["CUDA_VISIBLE_DEVICES"] == "0"
 
 
@@ -297,3 +300,72 @@ async def test_non_agentic_gets_no_llm_env(tmp_path, monkeypatch):
     monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "1")
     await M.handle(ctx)
     assert envs[-1] == {"CUDA_VISIBLE_DEVICES": "1"}
+
+
+@pytest.mark.asyncio
+async def test_non_carve_job_does_not_run_make_depth(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "bike", "agentic": True})
+    rec = ToolRecorder(); ctx.run_tool = rec
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    await M.handle(ctx)
+    assert not any(c[1].endswith("make_depth.py") for c in rec.calls)
+
+
+@pytest.mark.asyncio
+async def test_carve_generates_depth_and_passes_map_agentic(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "bike", "agentic": True, "carve": True})
+    rec = ToolRecorder(); ctx.run_tool = rec
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    result = await M.handle(ctx)
+    assert rec.calls[0][1].endswith("make_depth.py")
+    cmd = rec.calls[1]
+    assert cmd[1].endswith("mask_agentic.py")
+    assert "--depth-map" in cmd and "--carve" in cmd
+    assert result["depth_used"] is True
+
+
+@pytest.mark.asyncio
+async def test_carve_direct_sam3_gets_carve_and_depth(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "bike", "backend": "sam3", "carve": True})
+    rec = ToolRecorder(); ctx.run_tool = rec
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    result = await M.handle(ctx)
+    assert rec.calls[0][1].endswith("make_depth.py")
+    cmd = rec.calls[1]
+    assert cmd[1].endswith("mask_c2f.py")
+    assert "--sam3-carve" in cmd and "--depth-map" in cmd
+    assert result["depth_used"] is True
+
+
+@pytest.mark.asyncio
+async def test_depth_failure_degrades_gracefully(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "bike", "agentic": True, "carve": True})
+    rec = ToolRecorder()
+    async def failing_depth(cmd, timeout=None, env=None):
+        if cmd[1].endswith("make_depth.py"):
+            return 1, "", "no cuda"
+        return await rec(cmd, timeout)
+    ctx.run_tool = failing_depth
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    result = await M.handle(ctx)
+    cmd = rec.calls[0]
+    assert cmd[1].endswith("mask_agentic.py")
+    assert "--depth-map" not in cmd and "--carve" in cmd
+    assert result["depth_used"] is False
+
+
+@pytest.mark.asyncio
+async def test_direct_sam3_carve_depth_failure_degrades_gracefully(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "bike", "backend": "sam3", "carve": True})
+    rec = ToolRecorder()
+    async def failing_depth(cmd, timeout=None, env=None):
+        if cmd[1].endswith("make_depth.py"):
+            return 1, "", "no cuda"
+        return await rec(cmd, timeout)
+    ctx.run_tool = failing_depth
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    result = await M.handle(ctx)
+    cmd = rec.calls[0]
+    assert cmd[1].endswith("mask_c2f.py")
+    assert "--sam3-carve" in cmd and "--depth-map" not in cmd
+    assert result["depth_used"] is False

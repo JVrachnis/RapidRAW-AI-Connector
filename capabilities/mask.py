@@ -4,6 +4,7 @@ raw_develop.py) plus the bundled mask_tools/mask_points.py."""
 import base64
 import io
 import json
+import logging
 import re
 import subprocess
 import time
@@ -11,6 +12,8 @@ import numpy as np
 from pathlib import Path
 from PIL import Image
 from gateway.registry import Capability, register
+
+logger = logging.getLogger("Mask")
 
 PARAMS_SCHEMA = {
     "type": "object",
@@ -187,6 +190,22 @@ async def _develop_raw(ctx, env: "dict | None" = None) -> Path:
     return pick_base_frame(outdir)
 
 
+async def _make_depth(ctx, image_path: Path, env: "dict | None" = None) -> "Path | None":
+    """Run the bundled Depth Pro tool to produce a near=bright depth map for
+    the carve path (biggest lattice-quality win per the bench: BMX spokes fill
+    0.878->0.486). Best-effort: on failure, log-and-continue -- carve should
+    still run with its own texture fallback rather than failing the job."""
+    py = ctx.settings.GATEWAY_COMFY_VENV_PY
+    depth_path = ctx.workdir / "depth.png"
+    cmd = [py, _bundled("make_depth.py"), str(image_path),
+           "--tools-dir", ctx.settings.GATEWAY_TOOLS_DIR, "--out", str(depth_path)]
+    code, out, err = await ctx.run_tool(cmd, env=env)
+    if code != 0:
+        logger.warning("make_depth failed, continuing without depth map: %s", err[-400:])
+        return None
+    return depth_path
+
+
 async def handle(ctx) -> dict:
     t0 = time.perf_counter()
     if ctx.source is None:
@@ -218,6 +237,16 @@ async def handle(ctx) -> dict:
 
     out_path = ctx.workdir / "mask.png"
 
+    # Depth-guided carve is the biggest lattice-quality win (see-through
+    # subjects like BMX spokes: fill 0.878->0.486 in the bench). Generate the
+    # depth map once, up front, for either carve-eligible branch below.
+    depth_used = False
+    depth_path = None
+    carve = bool(p.get("carve"))
+    if carve:
+        depth_path = await _make_depth(ctx, image_path, env=tool_env)
+        depth_used = depth_path is not None
+
     if mode == "prompt" and p.get("agentic"):
         target = p["query"]
         rr = ctx.source.rrdata or {}
@@ -226,8 +255,10 @@ async def handle(ctx) -> dict:
             target = f"{target} (photo context: {', '.join(tags)})"
         cmd = [py, _tool(settings, "mask_agentic.py"), str(image_path),
                "--target", target, "--backend", backend, "--out", str(out_path)]
-        if p.get("carve"):
+        if carve:
             cmd.append("--carve")
+        if depth_used:
+            cmd += ["--depth-map", str(depth_path)]
         cmd += ["--mode", p.get("agentic_mode", "precise")]
         agentic_env = {
             "LLM_URL": settings.GATEWAY_LLM_URL,
@@ -242,6 +273,10 @@ async def handle(ctx) -> dict:
                "--birefnet-mode", "auto", "--out", str(out_path)]
         if p.get("sam3_multirep"):
             cmd += ["--sam3-multirep", "--sam3-parallel"]
+        if carve:
+            cmd.append("--sam3-carve")
+        if depth_used:
+            cmd += ["--depth-map", str(depth_path)]
     elif mode == "prompt":
         cmd = [py, _tool(settings, "mask_hq.py"), str(image_path),
                "--query", p["query"], "--out", str(out_path)]
@@ -295,6 +330,7 @@ async def handle(ctx) -> dict:
         "width": int(mask.shape[1]), "height": int(mask.shape[0]),
         "labels": parse_labels(stdout),
         "alignment": alignment,
+        "depth_used": depth_used,
         "timings": {"total_s": round(time.perf_counter() - t0, 2)},
     }
 
