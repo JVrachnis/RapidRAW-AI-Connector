@@ -102,3 +102,116 @@ def test_app_capability_view_survives_registry_mutation(tmp_path, clean_registry
 
     with TestClient(app2) as c2:
         assert [c["id"] for c in c2.get("/capabilities").json()] == ["other"]
+
+
+# --- Exact-params result cache (nudge-cache Change 2) -----------------------
+#
+# A retry with identical capability+source_id+params should short-circuit to
+# the existing completed job instead of paying pipeline work again.
+
+def test_identical_job_resubmit_returns_cached_same_job_id(client):
+    sid = upload(client).json()["source_id"]
+    body = {"source_id": sid, "params": {"msg": "hi"}}
+    first = client.post("/jobs/echo", json=body).json()
+    poll_done(client, first["job_id"])
+
+    second_resp = client.post("/jobs/echo", json=body)
+    assert second_resp.status_code == 202
+    second = second_resp.json()
+    assert second["cached"] is True
+    assert second["job_id"] == first["job_id"]
+    assert second["status"] == "done"
+
+    got = client.get(f"/jobs/{second['job_id']}").json()
+    assert got["status"] == "done"
+    assert got["result"]["echo"] == {"msg": "hi"}
+
+
+def test_key_order_does_not_defeat_cache(client):
+    sid = upload(client).json()["source_id"]
+    first = client.post("/jobs/echo", json={"source_id": sid,
+                                            "params": {"msg": "hi"}}).json()
+    poll_done(client, first["job_id"])
+
+    # Same params, but constructed with different key insertion order --
+    # cache lookup must compare parsed params, not raw JSON strings.
+    reordered_params = {}
+    reordered_params["msg"] = "hi"
+    second = client.post("/jobs/echo", json={"source_id": sid,
+                                             "params": reordered_params}).json()
+    assert second.get("cached") is True
+    assert second["job_id"] == first["job_id"]
+
+
+def test_different_params_not_cached(client):
+    sid = upload(client).json()["source_id"]
+    first = client.post("/jobs/echo", json={"source_id": sid,
+                                            "params": {"msg": "hi"}}).json()
+    poll_done(client, first["job_id"])
+
+    second = client.post("/jobs/echo", json={"source_id": sid,
+                                             "params": {"msg": "bye"}}).json()
+    assert not second.get("cached")
+    assert second["job_id"] != first["job_id"]
+
+
+def test_no_cache_flag_skips_lookup(client):
+    sid = upload(client).json()["source_id"]
+    first = client.post("/jobs/echo", json={"source_id": sid,
+                                            "params": {"msg": "hi"}}).json()
+    poll_done(client, first["job_id"])
+
+    second = client.post("/jobs/echo", json={"source_id": sid,
+                                             "params": {"msg": "hi"},
+                                             "no_cache": True}).json()
+    assert not second.get("cached")
+    assert second["job_id"] != first["job_id"]
+    poll_done(client, second["job_id"])
+
+
+def test_cancelled_job_never_returned_as_cache_hit(client):
+    # echo runs essentially instantly, so racing client.delete() against the
+    # worker to actually catch it 'queued' is flaky by construction; assert
+    # the cache-lookup contract directly by seeding a 'cancelled' row with the
+    # queue's own db, exactly as gateway/routes.py's SELECT would see it after
+    # a real cancel-while-queued.
+    sid = upload(client).json()["source_id"]
+    db = client.app.state.queue.db
+    from gateway.db import dumps, now
+    db.execute(
+        "INSERT INTO jobs(id,capability,source_id,params,priority,status,created,finished,error)"
+        " VALUES(?,?,?,?,?,?,?,?,?)",
+        ("cancelled-job-1", "echo", sid, dumps({"msg": "cancel-me"}), "interactive",
+         "cancelled", now(), now(), dumps({"kind": "cancelled", "detail": "test"})))
+
+    second = client.post("/jobs/echo", json={"source_id": sid,
+                                             "params": {"msg": "cancel-me"}}).json()
+    assert not second.get("cached")
+    assert second["job_id"] != "cancelled-job-1"
+
+
+def test_error_job_never_returned_as_cache_hit(client, monkeypatch):
+    import gateway.registry as registry
+    from gateway.registry import Capability
+
+    async def boom(ctx):
+        raise RuntimeError("boom")
+    registry.REGISTRY["echo"] = Capability(
+        id="echo", title="Echo",
+        params_schema={"type": "object", "required": ["msg"],
+                       "properties": {"msg": {"type": "string"}}},
+        handler=boom)
+    client.app.state.queue.handlers["echo"] = boom
+
+    sid = upload(client).json()["source_id"]
+    first = client.post("/jobs/echo", json={"source_id": sid,
+                                            "params": {"msg": "will-error"}}).json()
+    poll_done(client, first["job_id"])
+
+    async def echo(ctx):
+        return {"echo": ctx.params}
+    client.app.state.queue.handlers["echo"] = echo
+    second = client.post("/jobs/echo", json={"source_id": sid,
+                                             "params": {"msg": "will-error"}}).json()
+    assert not second.get("cached")
+    assert second["job_id"] != first["job_id"]

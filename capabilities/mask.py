@@ -6,6 +6,7 @@ import io
 import json
 import logging
 import re
+import shutil
 import subprocess
 import time
 import numpy as np
@@ -194,11 +195,31 @@ async def _develop_raw(ctx, env: "dict | None" = None) -> Path:
     return pick_base_frame(outdir)
 
 
+def _depth_cache_path(ctx) -> "Path | None":
+    """Per-source depth-map cache sidecar path: depth depends ONLY on the
+    source image bytes, never on job params (box/points/query), so a nudged
+    job re-using the same ctx.source can skip regenerating it entirely.
+    Returns None when ctx.source is unavailable (defensive; handle() already
+    requires ctx.source, but keeps this helper safe to call standalone)."""
+    if ctx.source is None:
+        return None
+    return Path(str(ctx.source.path) + ".depth.png")
+
+
 async def _make_depth(ctx, image_path: Path, env: "dict | None" = None) -> "Path | None":
     """Run the bundled Depth Pro tool to produce a near=bright depth map for
     the carve path (biggest lattice-quality win per the bench: BMX spokes fill
     0.878->0.486). Best-effort: on failure, log-and-continue -- carve should
-    still run with its own texture fallback rather than failing the job."""
+    still run with its own texture fallback rather than failing the job.
+
+    Cached beside the source file (<source path>.depth.png): depth depends
+    only on the source image, so a second carve job on the same ctx.source
+    (e.g. a nudged box/points retry) reuses it instead of paying the ~10-15s
+    model load + inference again."""
+    cache_path = _depth_cache_path(ctx)
+    if cache_path is not None and cache_path.exists():
+        return cache_path
+
     py = ctx.settings.GATEWAY_COMFY_VENV_PY
     depth_path = ctx.workdir / "depth.png"
     cmd = [py, _bundled("make_depth.py"), str(image_path),
@@ -207,6 +228,13 @@ async def _make_depth(ctx, image_path: Path, env: "dict | None" = None) -> "Path
     if code != 0:
         logger.warning("make_depth failed, continuing without depth map: %s", err[-400:])
         return None
+
+    if cache_path is not None:
+        try:
+            shutil.copyfile(depth_path, cache_path)
+        except OSError:
+            pass  # best-effort: cache miss next time is fine, job must not fail
+
     return depth_path
 
 

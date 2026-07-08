@@ -652,3 +652,91 @@ async def test_direct_sam3_carve_depth_failure_degrades_gracefully(tmp_path, mon
     assert cmd[1].endswith("mask_c2f.py")
     assert "--sam3-carve" in cmd and "--depth-map" not in cmd
     assert result["depth_used"] is False
+
+
+# --- Per-source depth-map cache (nudge-cache Change 1) -----------------------
+#
+# Depth Pro depends only on the source image, not on job params (box/points).
+# A "nudged" job re-uses the same ctx.source, so caching the depth map beside
+# the source file lets a second carve job on the same image skip the ~10-15s
+# depth generation entirely.
+
+def make_ctx_shared_source(tmp_path, params, src_path, dims=(8, 6), job_name="job"):
+    """Like make_ctx, but takes an existing source path so two contexts
+    can share the same ctx.source (simulating two jobs on one uploaded image)."""
+    workdir = tmp_path / job_name
+    workdir.mkdir()
+    ctx = JobContext(job_id=job_name, source_id="s1", params=params, workdir=workdir)
+    ctx.source = SourceRecord(source_id="s1", path=src_path, kind="tiff",
+                              width=dims[0], height=dims[1], exif=None, rrdata=None)
+    ctx.settings = Settings(CACHE_DIR=tmp_path)
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_second_carve_job_on_same_source_reuses_cached_depth(tmp_path, monkeypatch):
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    src_path = tmp_path / "src.tiff"
+    Image.new("RGB", (8, 6), (50, 60, 70)).save(src_path, "TIFF")
+
+    params1 = {"mode": "box", "box": [1, 1, 5, 4], "backend": "sam3", "carve": True}
+    ctx1 = make_ctx_shared_source(tmp_path, params1, src_path, job_name="job1")
+    rec = ToolRecorder(); ctx1.run_tool = rec
+    result1 = await M.handle(ctx1)
+    assert rec.calls[0][1].endswith("make_depth.py")
+    assert result1["depth_used"] is True
+
+    # Depth cache sidecar must now exist beside the source file.
+    depth_cache = Path(str(src_path) + ".depth.png")
+    assert depth_cache.exists()
+
+    # Second job, nudged box, same ctx.source -- must NOT call make_depth again.
+    params2 = {"mode": "box", "box": [2, 2, 6, 5], "backend": "sam3", "carve": True}
+    ctx2 = make_ctx_shared_source(tmp_path, params2, src_path, job_name="job2")
+    rec2 = ToolRecorder(); ctx2.run_tool = rec2
+    result2 = await M.handle(ctx2)
+    assert not any(c[1].endswith("make_depth.py") for c in rec2.calls)
+    cmd = rec2.calls[0]
+    assert cmd[1].endswith("mask_c2f.py")
+    assert "--depth-map" in cmd
+    assert result2["depth_used"] is True
+
+    # Exactly one make_depth invocation total across both jobs.
+    assert sum(1 for c in (rec.calls + rec2.calls) if c[1].endswith("make_depth.py")) == 1
+
+
+@pytest.mark.asyncio
+async def test_depth_cache_file_created_next_to_source(tmp_path, monkeypatch):
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    src_path = tmp_path / "src2.tiff"
+    Image.new("RGB", (8, 6), (10, 20, 30)).save(src_path, "TIFF")
+    params = {"mode": "prompt", "query": "bike", "backend": "sam3", "carve": True}
+    ctx = make_ctx_shared_source(tmp_path, params, src_path, job_name="jobA")
+    rec = ToolRecorder(); ctx.run_tool = rec
+    result = await M.handle(ctx)
+    assert result["depth_used"] is True
+    depth_cache = Path(str(src_path) + ".depth.png")
+    assert depth_cache.exists()
+    assert depth_cache.read_bytes()  # non-empty
+
+
+@pytest.mark.asyncio
+async def test_depth_cache_hit_skips_tool_and_reports_depth_used(tmp_path, monkeypatch):
+    # Pre-seed the cache sidecar (as if a previous job created it) and confirm
+    # a fresh job picks it up without invoking make_depth.py at all.
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    src_path = tmp_path / "src3.tiff"
+    Image.new("RGB", (8, 6), (1, 2, 3)).save(src_path, "TIFF")
+    depth_cache = Path(str(src_path) + ".depth.png")
+    gray_png(depth_cache, val=128)
+
+    params = {"mode": "prompt", "query": "bike", "agentic": True, "carve": True}
+    ctx = make_ctx_shared_source(tmp_path, params, src_path, job_name="jobB")
+    rec = ToolRecorder(); ctx.run_tool = rec
+    result = await M.handle(ctx)
+    assert not any(c[1].endswith("make_depth.py") for c in rec.calls)
+    cmd = rec.calls[0]
+    assert cmd[1].endswith("mask_agentic.py")
+    assert "--depth-map" in cmd
+    assert cmd[cmd.index("--depth-map") + 1] == str(depth_cache)
+    assert result["depth_used"] is True

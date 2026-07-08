@@ -1,5 +1,6 @@
 import io
 import pytest
+from pathlib import Path
 from PIL import Image
 from gateway.db import Db
 from gateway.store import SourceStore, SourceEvicted
@@ -50,3 +51,25 @@ def test_eviction_raises_gone_on_get(tmp_path):
     st.add(b_bytes, "b.png")
     with pytest.raises(SourceEvicted):
         st.get(r1["source_id"])
+
+
+def test_eviction_removes_depth_sidecar(tmp_path):
+    # Change 1 (nudge-cache): the per-source depth cache lives beside the
+    # source file as "<path>.depth.png". When the store evicts a source (LRU
+    # over max_bytes), that sidecar must be cleaned up too, or it would dangle
+    # forever pointing at nothing useful.
+    a_bytes = png_bytes(color=(1, 2, 3))
+    b_bytes = png_bytes(16, 12, (4, 5, 6))
+    st = make_store(tmp_path, max_bytes=len(a_bytes) + len(b_bytes) - 1)
+    r1 = st.add(a_bytes, "a.png")
+    row = st.db.query_one("SELECT path FROM sources WHERE id=?", (r1["source_id"],))
+    src_path = Path(row["path"])
+    depth_sidecar = Path(str(src_path) + ".depth.png")
+    depth_sidecar.write_bytes(b"fake depth map")
+    assert depth_sidecar.exists()
+
+    st.add(b_bytes, "b.png")  # triggers eviction of a (LRU)
+
+    with pytest.raises(SourceEvicted):
+        st.get(r1["source_id"])
+    assert not depth_sidecar.exists()

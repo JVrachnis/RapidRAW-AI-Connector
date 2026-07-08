@@ -81,7 +81,17 @@ class SourceStore:
             if total <= self.max_bytes:
                 break
             try:
-                Path(r["path"]).unlink(missing_ok=True)
+                path = Path(r["path"])
+                path.unlink(missing_ok=True)
+                # Clean up sidecars derived from this source (e.g. the
+                # per-source depth-map cache "<path>.depth.png" from the
+                # mask capability's carve path) -- otherwise they'd dangle
+                # forever pointing at an evicted source.
+                for sidecar in path.parent.glob(path.name + ".*"):
+                    try:
+                        sidecar.unlink()
+                    except OSError:
+                        pass
             finally:
                 self.db.execute("UPDATE sources SET evicted=1 WHERE id=?", (r["id"],))
                 total -= r["size"]
