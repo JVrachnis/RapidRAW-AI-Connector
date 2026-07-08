@@ -19,11 +19,13 @@ PARAMS_SCHEMA = {
     "type": "object",
     "required": ["mode"],
     "properties": {
-        "mode": {"enum": ["prompt", "points", "paint", "preset"]},
+        "mode": {"enum": ["prompt", "points", "paint", "preset", "box"]},
         "query": {"type": "string"},
         "points": {"type": "array",
                    "items": {"type": "array", "minItems": 3, "maxItems": 3,
                              "items": {"type": "number"}}},
+        "box": {"type": "array", "minItems": 4, "maxItems": 4,
+                "items": {"type": "number"}},
         "roi_mask_b64": {"type": "string"},
         "preset": {"enum": ["subject", "sky", "foreground"]},
         "agentic": {"type": "boolean", "default": False},
@@ -43,6 +45,8 @@ PARAMS_SCHEMA = {
          "then": {"required": ["mode", "roi_mask_b64"]}},
         {"if": {"properties": {"mode": {"const": "preset"}}},
          "then": {"required": ["mode", "preset"]}},
+        {"if": {"properties": {"mode": {"const": "box"}}},
+         "then": {"required": ["mode", "box"]}},
     ],
 }
 
@@ -206,6 +210,38 @@ async def _make_depth(ctx, image_path: Path, env: "dict | None" = None) -> "Path
     return depth_path
 
 
+async def classify_tool_failure(stderr: str) -> str:
+    """Classify a failed mask-tool subprocess's stderr into a user-facing
+    error kind. OOM is checked first since it is unambiguous from the text
+    alone; everything else is disambiguated with an actual health probe
+    rather than string-matching "ComfyUI"/"8188" -- those strings appear in
+    every tool traceback via the interpreter path
+    (~/comfy/ComfyUI/.venv/...), which previously caused GPU OOMs and other
+    unrelated failures to be misreported as "ComfyUI not running"."""
+    if "OutOfMemoryError" in stderr or "out of memory" in stderr.lower():
+        return "gpu_oom"
+    from engine import ComfyClient
+    if not await ComfyClient.check_health():
+        return "comfyui_down"
+    return "tool_error"
+
+
+def _apply_sam3_carve_flags(cmd: list, carve: bool, depth_used: bool, depth_path) -> None:
+    """Append --sam3-carve/--depth-map to a mask_c2f.py command, shared by
+    the direct sam3 prompt branch and the sam3-backed preset branch."""
+    if carve:
+        cmd.append("--sam3-carve")
+    if depth_used:
+        cmd += ["--depth-map", str(depth_path)]
+
+
+PRESET_QUERIES = {
+    "subject": "the main subject.",
+    "sky": "sky.",
+    "foreground": "foreground.",
+}
+
+
 async def handle(ctx) -> dict:
     t0 = time.perf_counter()
     if ctx.source is None:
@@ -273,10 +309,7 @@ async def handle(ctx) -> dict:
                "--birefnet-mode", "auto", "--out", str(out_path)]
         if p.get("sam3_multirep"):
             cmd += ["--sam3-multirep", "--sam3-parallel"]
-        if carve:
-            cmd.append("--sam3-carve")
-        if depth_used:
-            cmd += ["--depth-map", str(depth_path)]
+        _apply_sam3_carve_flags(cmd, carve, depth_used, depth_path)
     elif mode == "prompt":
         cmd = [py, _tool(settings, "mask_hq.py"), str(image_path),
                "--query", p["query"], "--out", str(out_path)]
@@ -288,6 +321,13 @@ async def handle(ctx) -> dict:
         cmd = [py, _bundled("mask_points.py"), str(image_path),
                "--points", json.dumps(p["points"]), "--backend", backend,
                "--tools-dir", settings.GATEWAY_TOOLS_DIR, "--out", str(out_path)]
+    elif mode == "box":
+        # Same pixel-space caveats as "points" (raw sources: best_effort).
+        cmd = [py, _bundled("mask_points.py"), str(image_path),
+               "--box", ",".join(str(v) for v in p["box"]), "--backend", backend,
+               "--tools-dir", settings.GATEWAY_TOOLS_DIR, "--out", str(out_path)]
+        if p.get("points"):
+            cmd += ["--points", json.dumps(p["points"])]
     elif mode == "paint":
         roi_path = ctx.workdir / "roi.png"
         roi_path.write_bytes(base64.b64decode(p["roi_mask_b64"]))
@@ -296,19 +336,28 @@ async def handle(ctx) -> dict:
                "--roi", str(roi_path), "--out", str(out_path)]
     else:  # preset
         preset = p["preset"]
-        if preset == "subject":
+        query = PRESET_QUERIES[preset]
+        if backend == "sam3":
+            # mask_hq.py (BiRefNet+ViTMatte) OOMs on smaller GPUs; route
+            # sam3-backed presets through the lighter mask_c2f.py instead,
+            # reusing the same carve/depth plumbing as the direct sam3 branch.
+            cmd = [py, _tool(settings, "mask_c2f.py"), str(image_path),
+                   "--query", query, "--backend", "sam3",
+                   "--birefnet-mode", "auto", "--out", str(out_path)]
+            _apply_sam3_carve_flags(cmd, carve, depth_used, depth_path)
+        elif preset == "subject":
             cmd = [py, _tool(settings, "mask_hq.py"), str(image_path),
-                   "--query", "the main subject.", "--main-subject", "--out", str(out_path)]
+                   "--query", query, "--main-subject", "--out", str(out_path)]
         elif preset == "sky":
             cmd = [py, _tool(settings, "mask_hq.py"), str(image_path),
-                   "--query", "sky.", "--out", str(out_path)]
+                   "--query", query, "--out", str(out_path)]
         else:  # foreground
             cmd = [py, _tool(settings, "mask_hq.py"), str(image_path),
-                   "--no-sam", "--query", "foreground.", "--out", str(out_path)]
+                   "--no-sam", "--query", query, "--out", str(out_path)]
 
     code, stdout, stderr = await ctx.run_tool(cmd, env=tool_env)
     if code != 0:
-        kind = "comfyui_down" if "ComfyUI" in stderr or "8188" in stderr else "tool_error"
+        kind = await classify_tool_failure(stderr)
         e = RuntimeError(f"mask tool failed: {stderr[-800:]}")
         e.kind = kind
         raise e
@@ -338,5 +387,5 @@ async def handle(ctx) -> dict:
 register(Capability(
     id="mask", title="AI masking (GroundedSAM/SAM2/BiRefNet/ViTMatte)",
     params_schema=PARAMS_SCHEMA, handler=handle,
-    modes=["prompt", "points", "paint", "preset"],
+    modes=["prompt", "points", "paint", "preset", "box"],
     presets=["subject", "sky", "foreground"]))

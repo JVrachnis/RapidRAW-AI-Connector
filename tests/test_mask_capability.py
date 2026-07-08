@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import jsonschema
 import numpy as np
 import pytest
 from pathlib import Path
@@ -98,12 +99,116 @@ async def test_points_mode_calls_points_tool(tmp_path):
     pts = json.loads(cmd[cmd.index("--points") + 1])
     assert pts == [[4, 3, 1], [1, 1, 0]]
 
+
+def test_schema_accepts_box_mode_with_box():
+    jsonschema.validate({"mode": "box", "box": [1, 2, 3, 4]}, M.PARAMS_SCHEMA)
+
+
+def test_schema_rejects_box_mode_without_box():
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"mode": "box"}, M.PARAMS_SCHEMA)
+
+
+def test_schema_rejects_box_with_wrong_length():
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"mode": "box", "box": [1, 2, 3]}, M.PARAMS_SCHEMA)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"mode": "box", "box": [1, 2, 3, 4, 5]}, M.PARAMS_SCHEMA)
+
+
+@pytest.mark.asyncio
+async def test_box_mode_calls_points_tool_with_box_only(tmp_path):
+    ctx = make_ctx(tmp_path, {"mode": "box", "box": [10, 20, 110, 220]})
+    rec = ToolRecorder(); ctx.run_tool = rec
+    await M.handle(ctx)
+    cmd = rec.calls[0]
+    assert cmd[1].endswith("mask_points.py")
+    assert cmd[cmd.index("--box") + 1] == "10,20,110,220"
+    assert "--points" not in cmd
+
+
+@pytest.mark.asyncio
+async def test_box_mode_with_points_passes_both(tmp_path):
+    ctx = make_ctx(tmp_path, {"mode": "box", "box": [10, 20, 110, 220],
+                              "points": [[50, 50, 1]]})
+    rec = ToolRecorder(); ctx.run_tool = rec
+    await M.handle(ctx)
+    cmd = rec.calls[0]
+    assert cmd[1].endswith("mask_points.py")
+    assert cmd[cmd.index("--box") + 1] == "10,20,110,220"
+    pts = json.loads(cmd[cmd.index("--points") + 1])
+    assert pts == [[50, 50, 1]]
+
 @pytest.mark.asyncio
 async def test_preset_subject(tmp_path):
     ctx = make_ctx(tmp_path, {"mode": "preset", "preset": "subject"})
     rec = ToolRecorder(); ctx.run_tool = rec
     await M.handle(ctx)
     assert rec.calls[0][1].endswith("mask_hq.py")
+
+
+@pytest.mark.asyncio
+async def test_preset_default_backend_sam2_still_mask_hq(tmp_path):
+    # backend defaults to sam2 -- presets keep routing to mask_hq (BiRefNet+
+    # ViTMatte) unchanged, since that's the only regression risk this fix
+    # must avoid.
+    for preset, query in (("subject", "the main subject."), ("sky", "sky."),
+                          ("foreground", "foreground.")):
+        sub = tmp_path / preset
+        sub.mkdir()
+        ctx = make_ctx(sub, {"mode": "preset", "preset": preset})
+        rec = ToolRecorder(); ctx.run_tool = rec
+        await M.handle(ctx)
+        cmd = rec.calls[0]
+        assert cmd[1].endswith("mask_hq.py")
+        assert cmd[cmd.index("--query") + 1] == query
+
+
+@pytest.mark.asyncio
+async def test_preset_sam3_backend_routes_to_mask_c2f(tmp_path):
+    # presets ALWAYS routed to mask_hq (BiRefNet+ViTMatte), which OOMs on
+    # smaller boxes. When backend == "sam3", route through mask_c2f.py
+    # instead with canned queries, so presets actually work locally.
+    cases = [("subject", "the main subject."), ("sky", "sky."),
+             ("foreground", "foreground.")]
+    for preset, expected_query in cases:
+        sub = tmp_path / preset
+        sub.mkdir()
+        ctx = make_ctx(sub, {"mode": "preset", "preset": preset, "backend": "sam3"})
+        rec = ToolRecorder(); ctx.run_tool = rec
+        await M.handle(ctx)
+        cmd = rec.calls[0]
+        assert cmd[1].endswith("mask_c2f.py"), f"{preset}: {cmd}"
+        assert cmd[cmd.index("--query") + 1] == expected_query
+        assert cmd[cmd.index("--backend") + 1] == "sam3"
+
+
+@pytest.mark.asyncio
+async def test_preset_sam3_carve_reuses_shared_plumbing(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path, {"mode": "preset", "preset": "subject", "backend": "sam3",
+                              "carve": True})
+    rec = ToolRecorder(); ctx.run_tool = rec
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    result = await M.handle(ctx)
+    assert rec.calls[0][1].endswith("make_depth.py")
+    cmd = rec.calls[1]
+    assert cmd[1].endswith("mask_c2f.py")
+    assert "--sam3-carve" in cmd and "--depth-map" in cmd
+    assert result["depth_used"] is True
+
+
+@pytest.mark.asyncio
+async def test_preset_sam2_backend_ignores_carve_like_before(tmp_path, monkeypatch):
+    # sam2-backed presets (mask_hq.py) don't take --sam3-carve/--depth-map;
+    # carve is a sam3-only concept here, matching the pre-existing direct
+    # sam3 vs mask_hq split.
+    ctx = make_ctx(tmp_path, {"mode": "preset", "preset": "sky", "carve": True})
+    rec = ToolRecorder(); ctx.run_tool = rec
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    await M.handle(ctx)
+    cmd = rec.calls[-1]
+    assert cmd[1].endswith("mask_hq.py")
+    assert "--sam3-carve" not in cmd and "--depth-map" not in cmd
 
 @pytest.mark.asyncio
 async def test_raw_source_develops_first_and_flags_alignment(tmp_path):
@@ -176,25 +281,87 @@ def test_pick_base_frame_empty_raises(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_tool_failure_classified_comfyui_down(tmp_path):
+async def test_tool_failure_classified_comfyui_down(tmp_path, monkeypatch):
+    # Real ComfyUI-down stderr still contains "ComfyUI"/"8188" via the venv
+    # interpreter path, so classification must not string-match on those --
+    # it must actually probe ComfyClient.check_health().
     ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "x."})
     async def failing(cmd, timeout=None, env=None):
         return 1, "", "ConnectionRefused connecting to 127.0.0.1:8188"
     ctx.run_tool = failing
+    from engine import ComfyClient
+    async def unhealthy():
+        return False
+    monkeypatch.setattr(ComfyClient, "check_health", unhealthy)
     with pytest.raises(RuntimeError) as ei:
         await M.handle(ctx)
     assert getattr(ei.value, "kind", None) == "comfyui_down"
 
 
 @pytest.mark.asyncio
-async def test_tool_failure_classified_tool_error(tmp_path):
+async def test_tool_failure_classified_tool_error_when_comfy_healthy(tmp_path, monkeypatch):
+    # Generic failure + healthy ComfyUI -> tool_error, even though the
+    # traceback contains "ComfyUI" (interpreter path) -- the false-positive
+    # this fix targets.
     ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "x."})
     async def failing(cmd, timeout=None, env=None):
-        return 2, "", "torch OOM"
+        return 2, "", ("Traceback (most recent call last):\n"
+                        '  File "/home/user/comfy/ComfyUI/.venv/lib/site-packages/torch/x.py"\n'
+                        "RuntimeError: some tool error")
     ctx.run_tool = failing
+    from engine import ComfyClient
+    async def healthy():
+        return True
+    monkeypatch.setattr(ComfyClient, "check_health", healthy)
     with pytest.raises(RuntimeError) as ei:
         await M.handle(ctx)
     assert getattr(ei.value, "kind", None) == "tool_error"
+
+
+@pytest.mark.asyncio
+async def test_tool_failure_oom_classified_gpu_oom_even_with_comfyui_strings(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "x."})
+    async def failing(cmd, timeout=None, env=None):
+        return 1, "", ('  File "/home/user/comfy/ComfyUI/.venv/lib/site-packages/torch/x.py"\n'
+                        "torch.cuda.OutOfMemoryError: CUDA out of memory")
+    ctx.run_tool = failing
+    from engine import ComfyClient
+    async def should_not_be_called():
+        raise AssertionError("check_health should not be called when OOM is detected first")
+    monkeypatch.setattr(ComfyClient, "check_health", should_not_be_called)
+    with pytest.raises(RuntimeError) as ei:
+        await M.handle(ctx)
+    assert getattr(ei.value, "kind", None) == "gpu_oom"
+
+
+@pytest.mark.asyncio
+async def test_tool_failure_oom_lowercase_message_classified_gpu_oom(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "x."})
+    async def failing(cmd, timeout=None, env=None):
+        return 1, "", "RuntimeError: CUDA error: out of memory"
+    ctx.run_tool = failing
+    from engine import ComfyClient
+    async def should_not_be_called():
+        raise AssertionError("check_health should not be called when OOM is detected first")
+    monkeypatch.setattr(ComfyClient, "check_health", should_not_be_called)
+    with pytest.raises(RuntimeError) as ei:
+        await M.handle(ctx)
+    assert getattr(ei.value, "kind", None) == "gpu_oom"
+
+
+def test_classify_tool_failure_directly():
+    import asyncio
+    from unittest.mock import patch, AsyncMock
+    from capabilities.mask import classify_tool_failure
+
+    async def run():
+        assert await classify_tool_failure("torch.cuda.OutOfMemoryError: out of memory") == "gpu_oom"
+        assert await classify_tool_failure("some out of memory issue") == "gpu_oom"
+        with patch("engine.ComfyClient.check_health", new=AsyncMock(return_value=False)):
+            assert await classify_tool_failure("generic stderr, ComfyUI mentioned") == "comfyui_down"
+        with patch("engine.ComfyClient.check_health", new=AsyncMock(return_value=True)):
+            assert await classify_tool_failure("generic stderr") == "tool_error"
+    asyncio.run(run())
 
 
 @pytest.mark.asyncio
