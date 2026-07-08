@@ -267,3 +267,33 @@ async def test_multirep_keeps_both_gpus_visible(tmp_path, monkeypatch):
     monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "1")
     await M.handle(ctx)
     assert envs[-1] is None
+
+
+@pytest.mark.asyncio
+async def test_agentic_carve_and_mode_flags(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "the bike", "agentic": True,
+                              "carve": True, "agentic_mode": "removal"})
+    rec = ToolRecorder(); envs = []
+    async def rec_env(cmd, timeout=None, env=None):
+        envs.append(env); return await rec(cmd, timeout)
+    ctx.run_tool = rec_env
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "0")
+    await M.handle(ctx)
+    cmd = rec.calls[0]
+    assert "--carve" in cmd
+    assert cmd[cmd.index("--mode") + 1] == "removal"
+    env = envs[-1]
+    assert env["VLM_MODEL"] == "qwen3-vl:4b-instruct-q8_0"
+    assert env["CUDA_VISIBLE_DEVICES"] == "0"
+
+
+@pytest.mark.asyncio
+async def test_non_agentic_gets_no_llm_env(tmp_path, monkeypatch):
+    ctx = make_ctx(tmp_path, {"mode": "prompt", "query": "x.", "backend": "sam3"})
+    rec = ToolRecorder(); envs = []
+    async def rec_env(cmd, timeout=None, env=None):
+        envs.append(env); return await rec(cmd, timeout)
+    ctx.run_tool = rec_env
+    monkeypatch.setattr(M, "pick_cuda_device", lambda min_free_mb=3000: "1")
+    await M.handle(ctx)
+    assert envs[-1] == {"CUDA_VISIBLE_DEVICES": "1"}

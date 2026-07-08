@@ -62,13 +62,15 @@ This fork extends the connector into a general AI-operations gateway:
 - `POST /sources` — upload image (TIFF/RAW/JPEG) + optional `exif`/`rrdata` JSON once (content-addressed)
 - `POST /jobs/{capability}` — enqueue; `GET /jobs/{id}` — poll; `DELETE /jobs/{id}` — cancel; `GET /queue` — list
 - Capabilities v1: `mask` (GroundedSAM/SAM2/SAM3/BiRefNet/ViTMatte via the tools in `GATEWAY_TOOLS_DIR`), `inpaint`
-- Mask modes: `prompt` (backend `sam2` = mask_hq GroundedSAM+BiRefNet, `sam3` = mask_c2f SAM3 concept segmentation, `sam3_multirep` for multi-representation 2-GPU union), `points`, `paint`, `preset`, plus `agentic` LLM/VLM refinement
+- Mask modes: `prompt` (backend `sam2` = mask_hq GroundedSAM+BiRefNet, `sam3` = mask_c2f SAM3 concept segmentation, `sam3_multirep` for multi-representation 2-GPU union), `points`, `paint`, `preset`, plus `agentic` LLM/VLM refinement (with `carve` for see-through/lattice recovery and `agentic_mode` `precise`|`removal`)
 - Legacy `/upload_source` + `/inpaint` kept byte-compatible for stock RapidRAW
 
 Config env vars: `GATEWAY_TOKEN`, `GATEWAY_TOOLS_DIR` (default `~/comfy`),
 `GATEWAY_CACHE_MAX_GB` (20), `GATEWAY_RESULT_TTL_HOURS` (24),
 `GATEWAY_JOB_TIMEOUT_S` (600), `GATEWAY_DB_PATH`,
-`GATEWAY_COMFY_VENV_PY`, `GATEWAY_RAWTOOLS_PY`.
+`GATEWAY_COMFY_VENV_PY`, `GATEWAY_RAWTOOLS_PY`,
+`GATEWAY_LLM_URL`/`GATEWAY_INTENT_LLM` (agentic concept-expansion LLM),
+`GATEWAY_VLM_URL`/`GATEWAY_VLM_MODEL` (agentic judge VLM).
 
 Known v1 limits:
 - `ev_stack` param accepted but multi-EV `--det-images` wiring into mask_c2f is not connected yet.
@@ -78,6 +80,7 @@ Known v1 limits:
 - Legacy source aliases (`/upload_source`) are in-memory and process-wide.
 - Each mask job pays model cold-load in its subprocess (~5-30s); a persistent tool-server is a future optimization.
 - SAM3 points backend falls back to SAM2 with a warning.
+- Agentic depth-map input not yet wired through the API (texture fallback active); Depth Pro integration is a follow-up.
 
 Deploy on inferno (or any GPU host):
 ```bash

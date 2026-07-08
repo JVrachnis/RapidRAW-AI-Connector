@@ -27,6 +27,8 @@ PARAMS_SCHEMA = {
         "backend": {"enum": ["sam2", "sam3"], "default": "sam2"},
         "sam3_multirep": {"type": "boolean", "default": False},
         "matte": {"type": "boolean", "default": True},
+        "carve": {"type": "boolean", "default": False},
+        "agentic_mode": {"enum": ["precise", "removal"], "default": "precise"},
         "ev_stack": {},
     },
     "allOf": [
@@ -224,6 +226,16 @@ async def handle(ctx) -> dict:
             target = f"{target} (photo context: {', '.join(tags)})"
         cmd = [py, _tool(settings, "mask_agentic.py"), str(image_path),
                "--target", target, "--backend", backend, "--out", str(out_path)]
+        if p.get("carve"):
+            cmd.append("--carve")
+        cmd += ["--mode", p.get("agentic_mode", "precise")]
+        agentic_env = {
+            "LLM_URL": settings.GATEWAY_LLM_URL,
+            "INTENT_LLM": settings.GATEWAY_INTENT_LLM,
+            "VLM_URL": settings.GATEWAY_VLM_URL,
+            "VLM_MODEL": settings.GATEWAY_VLM_MODEL,
+        }
+        tool_env = {**agentic_env, **(tool_env or {})}
     elif mode == "prompt" and backend == "sam3":
         cmd = [py, _tool(settings, "mask_c2f.py"), str(image_path),
                "--query", p["query"], "--backend", "sam3",

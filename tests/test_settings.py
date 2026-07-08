@@ -18,3 +18,17 @@ def test_gateway_settings_env_override(tmp_path, monkeypatch):
     assert s.GATEWAY_TOKEN == "sekrit"
     assert s.GATEWAY_JOB_TIMEOUT_S == 5
     assert s.gateway_db_path == tmp_path / "j.db"
+
+def test_gateway_settings_agentic_llm_vlm_defaults(tmp_path, monkeypatch):
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path))
+    s = Settings()
+    assert s.GATEWAY_LLM_URL == "http://127.0.0.1:11434/v1/chat/completions"
+    assert s.GATEWAY_INTENT_LLM == "gemma3:4b"
+    assert s.GATEWAY_VLM_URL == "http://127.0.0.1:11434/v1/chat/completions"
+    assert s.GATEWAY_VLM_MODEL == "qwen3-vl:4b-instruct-q8_0"
+
+def test_gateway_settings_agentic_llm_vlm_env_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("CACHE_DIR", str(tmp_path))
+    monkeypatch.setenv("GATEWAY_VLM_MODEL", "custom-vlm:latest")
+    s = Settings()
+    assert s.GATEWAY_VLM_MODEL == "custom-vlm:latest"

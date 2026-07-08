@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     GATEWAY_DB_PATH: Optional[Path] = None
     GATEWAY_COMFY_VENV_PY: str = os.path.expanduser("~/comfy/ComfyUI/.venv/bin/python")
     GATEWAY_RAWTOOLS_PY: str = os.path.expanduser("~/rawtools/bin/python")
+    GATEWAY_LLM_URL: str = "http://127.0.0.1:11434/v1/chat/completions"
+    GATEWAY_INTENT_LLM: str = "gemma3:4b"
+    GATEWAY_VLM_URL: str = "http://127.0.0.1:11434/v1/chat/completions"
+    GATEWAY_VLM_MODEL: str = "qwen3-vl:4b-instruct-q8_0"
 
     @property
     def gateway_db_path(self) -> Path:
