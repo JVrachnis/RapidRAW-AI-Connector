@@ -313,7 +313,7 @@ version. All modes are on the `mask` capability (`POST /jobs/mask`).
 | `prompt` | `query` | `backend: sam2` (default) → `mask_hq.py` (GroundingDINO+SAM2+BiRefNet+ViTMatte). `backend: sam3` → `mask_c2f.py` SAM3 concept segmentation. `agentic: true` → `mask_agentic.py`'s LLM/VLM refine loop over `mask_c2f.py`, regardless of `backend`. |
 | `points` | `points: [[x,y,label],...]` | Always SAM2 (bundled `mask_points.py`); `backend: sam3` is accepted but falls back to SAM2 with a logged warning (SAM3 isn't wired for point prompts). |
 | `box` | `box: [x0,y0,x1,y1]` | `backend: sam2` (default) → bare SAM2 box prompt via `mask_points.py`. `backend: sam3` → the box becomes a **region hint** (rendered as a coarse ROI mask) restricting `mask_c2f.py --roi`'s search, not a raw box prompt. `agentic: true` → same ROI-restricted search but through `mask_agentic.py`. |
-| `paint` | `roi_mask_b64` | A free-form painted ROI mask restricts `mask_c2f.py --roi`'s search (SAM3-backed). |
+| `paint` | `roi_mask_b64` | A free-form painted ROI mask restricts `mask_c2f.py --roi`'s search (SAM3-backed). RapidRAW's **ellipse** selection tool also arrives as this mode — the app rasterizes the ellipse to an ROI client-side, so no separate gateway mode exists for it. |
 | `preset` | `preset: subject\|sky\|foreground` | `backend: sam2` (default) → `mask_hq.py` with the preset's canned query (`mask_hq.py` OOMs on smaller GPUs for some presets, hence the `sam3` alternative). `backend: sam3` → routed through the lighter `mask_c2f.py` instead. |
 
 Other params:
